@@ -1,0 +1,454 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * てんびん E2E 検証ハーネス
+ *
+ * 実インターフェース主義: 操作は canvas への実マウスイベント（タッチのフォールバック経路）
+ * のみで行い、内部状態 window.__tenbin は「読み取り」だけに使う（docs/test-hooks.md 参照）。
+ * テスト入力の注入は ?seed / ?timescale の2つのみ。
+ *
+ * 実行: node harness/run.js
+ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// ---- playwright 解決（グローバル導入をフォールバックで拾う） ----
+function requirePlaywright() {
+  try { return require('playwright'); } catch (_) {}
+  const globalRoot = execSync('npm root -g').toString().trim();
+  return require(path.join(globalRoot, 'playwright'));
+}
+const { chromium } = requirePlaywright();
+
+const ROOT = path.resolve(__dirname, '..');
+const SEED = 7;
+const TIMESCALE = 8;
+
+// ---- ミニテストフレーム ----
+const results = [];
+let page, ctx, browser, baseURL;
+
+async function test(name, fn, timeoutMs = 90_000) {
+  const started = Date.now();
+  try {
+    await Promise.race([
+      fn(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout ${timeoutMs}ms`)), timeoutMs)),
+    ]);
+    results.push({ name, ok: true, ms: Date.now() - started });
+    console.log(`  ok    ${name} (${Date.now() - started}ms)`);
+  } catch (e) {
+    results.push({ name, ok: false, ms: Date.now() - started, err: e });
+    console.log(`  FAIL  ${name}: ${e.message}`);
+  }
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+// ---- ページ状態の読み取りヘルパ（読み取りのみ） ----
+async function snap() {
+  return page.evaluate(() => {
+    const t = window.__tenbin;
+    if (!t) return null;
+    return {
+      phase: t.phase, problemIndex: t.problemIndex, levels: t.levels,
+      apples: t.apples, plates: t.plates, balance: t.balance, counts: t.counts,
+      orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
+      menuRegions: t.menuRegions, celebrationType: t.celebrationType,
+      session: t.session, problemLog: t.problemLog,
+    };
+  });
+}
+async function toClient(x, y) {
+  return page.evaluate(([x, y]) => window.__tenbin.toClient(x, y), [x, y]);
+}
+async function waitFor(fn, desc, timeoutMs = 30_000, intervalMs = 60) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`waitFor timeout: ${desc}`);
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+}
+// 実マウスイベントでのドラッグ（論理座標指定）
+async function drag(fromL, toL, { steps = 10, settleMs = 120 } = {}) {
+  const a = await toClient(fromL.x, fromL.y);
+  const b = await toClient(toL.x, toL.y);
+  await page.mouse.move(a.x, a.y);
+  await page.mouse.down();
+  await new Promise(r => setTimeout(r, 60));
+  for (let i = 1; i <= steps; i++) {
+    await page.mouse.move(a.x + (b.x - a.x) * i / steps, a.y + (b.y - a.y) * i / steps);
+    await new Promise(r => setTimeout(r, 16));
+  }
+  await new Promise(r => setTimeout(r, settleMs)); // lerp追従の収束待ち
+  await page.mouse.up();
+}
+async function tap(logical) {
+  const c = await toClient(logical.x, logical.y);
+  await page.mouse.click(c.x, c.y);
+}
+// 未搭載のりんご1個を指定皿へ載せる。載った個数が増えるまで待つ
+async function placeOneApple(apple, plateKey) {
+  const before = await snap();
+  const total = before.counts.left + before.counts.right;
+  await drag({ x: apple.x, y: apple.y }, before.plates[plateKey]);
+  await waitFor(async () => {
+    const s = await snap();
+    return s.counts.left + s.counts.right > total;
+  }, `apple ${apple.id} lands on plate ${plateKey}`);
+}
+// 現在の問題を完了させる。assign(apple)→'L'|'R'
+async function completeProblem(assign) {
+  for (;;) {
+    const s = await snap();
+    if (s.phase !== 'play') break;
+    const free = s.apples.find(a => a.state === 'field' || a.state === 'ground');
+    if (!free) break;
+    await placeOneApple(free, assign(free, s));
+  }
+  return waitFor(async () => {
+    const s = await snap();
+    return (s.phase === 'celebrate' || s.phase === 'sessionEnd' || s.phase === 'transition') ? s : null;
+  }, 'problem completion (celebrate)', 60_000);
+}
+async function waitForProblem(index) {
+  return waitFor(async () => {
+    const s = await snap();
+    return (s.phase === 'play' && s.problemIndex === index) ? s : null;
+  }, `problem ${index} starts`, 60_000);
+}
+function readLogs() {
+  return page.evaluate(() => JSON.parse(localStorage.getItem('tenbin_logs') || '[]'));
+}
+
+// ---- 静的サーバ ----
+function serve() {
+  return new Promise(resolve => {
+    const server = http.createServer((req, res) => {
+      const urlPath = req.url.split('?')[0];
+      const file = path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath);
+      if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+        res.writeHead(404); res.end('not found'); return;
+      }
+      const ext = path.extname(file);
+      const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.md': 'text/plain' }[ext] || 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime });
+      res.end(fs.readFileSync(file));
+    });
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+
+// ---- 本体 ----
+(async () => {
+  if (!fs.existsSync(path.join(ROOT, 'index.html'))) {
+    console.error('index.html がまだ存在しない（検証の器のみ整備済み）');
+    process.exit(1);
+  }
+  const server = await serve();
+  baseURL = `http://127.0.0.1:${server.address().port}`;
+
+  browser = await chromium.launch();
+  ctx = await browser.newContext({
+    viewport: { width: 1280, height: 960 },
+    permissions: ['clipboard-read', 'clipboard-write'],
+    hasTouch: false,
+  });
+  // 文字禁止の監視: 親メニュー非表示中の fillText/strokeText 呼び出しを違反として数える
+  await ctx.addInitScript(() => {
+    const rec = { violations: 0, samples: [] };
+    Object.defineProperty(window, '__textViolations', { value: rec });
+    for (const m of ['fillText', 'strokeText']) {
+      const orig = CanvasRenderingContext2D.prototype[m];
+      CanvasRenderingContext2D.prototype[m] = function (...a) {
+        const t = window.__tenbin;
+        if (!t || !t.menuOpen) {
+          rec.violations++;
+          if (rec.samples.length < 5) rec.samples.push(String(a[0]));
+        }
+        return orig.apply(this, a);
+      };
+    }
+  });
+  const pageErrors = [];
+  page = await ctx.newPage();
+  page.on('pageerror', e => pageErrors.push(`pageerror: ${e.message}`));
+  page.on('console', m => { if (m.type() === 'error') pageErrors.push(`console.error: ${m.text()}`); });
+
+  console.log('tenbin E2E harness');
+
+  // --- 揺れの触感（非臨界減衰）: 低速で1個載せて角度の目標横断を観測 ---
+  await test('spring: apple placement causes visible oscillation (non-critical damping)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2`);
+    const first = await waitFor(snap, '__tenbin exposed', 10_000);
+    // 回帰ガード: 公開読み取り面は最初のフレーム前でも未初期化値を返さない
+    assert(first.plates.L.x > 0 && first.plates.R.x > first.plates.L.x,
+      `plates valid from first exposure, got ${JSON.stringify(first.plates)}`);
+    const s = await waitForProblem(0);
+    const apple = s.apples.find(a => a.state === 'field');
+    assert(apple, 'field apple exists');
+    await drag({ x: apple.x, y: apple.y }, s.plates.R);
+    // 着地（＝バネへの入力）を確認してからサンプリング開始
+    await waitFor(async () => {
+      const st = await snap();
+      return st.counts.right === 1 ? st : null;
+    }, 'apple lands on plate R before sampling', 5_000, 15);
+    // 角度サンプリング: (angle - target) の符号反転回数 >= 2 で「ゆらっ」を確認
+    const series = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000) {
+      const b = (await snap()).balance;
+      series.push(b.angle - b.target);
+      await new Promise(r => setTimeout(r, 25));
+    }
+    let flips = 0;
+    let prev = 0;
+    for (const d of series) {
+      const sg = Math.abs(d) < 0.05 ? 0 : Math.sign(d);
+      if (sg !== 0 && prev !== 0 && sg !== prev) flips++;
+      if (sg !== 0) prev = sg;
+    }
+    const lo = Math.min(...series).toFixed(2), hi = Math.max(...series).toFixed(2);
+    assert(flips >= 2, `expected >=2 overshoot flips, got ${flips} (angle-target range [${lo}, ${hi}], n=${series.length})`);
+  });
+
+  // --- 監査所見1: 演出中に皿のりんごをつまんでもゲームが死なない ---
+  await test('grab during celebration: input gated, game never freezes', async () => {
+    // spring テストの続き（timescale=2、皿にりんご1個載っている状態）。残りを全部載せて演出へ
+    await completeProblem(() => 'R');
+    // 演出中に「まだ食べられていない」皿上のりんごをつまんで外へ捨てようとする
+    // （旧実装: plate から外れた id が食べキューに残り TypeError → rAF ループ恒久停止）
+    const st = await snap();
+    const target = [...st.apples].reverse().find(a => a.state === 'plate');
+    if (target) {
+      await drag({ x: target.x, y: target.y }, { x: 512, y: 200 }, { steps: 4, settleMs: 40 });
+    }
+    // ゲームが生きていて次問へ自動遷移すること（フリーズすればここでタイムアウト）
+    await waitForProblem(1);
+  }, 120_000);
+
+  // --- 本編セッション（高速） ---
+  await test('boot: play phase, level table, landscape ok', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    const s = await waitForProblem(0);
+    assert(s.levels.length === 5, `levels=5, got ${s.levels.length}`);
+    const lv = s.levels[0];
+    assert(s.apples.length === lv.left + lv.right, `apples=${lv.left + lv.right}, got ${s.apples.length}`);
+    assert(!s.orientationBlocked, 'not blocked in landscape');
+  });
+
+  await test('drag to plate: snap + counts + tilt direction', async () => {
+    const s = await snap();
+    const apple = s.apples.find(a => a.state === 'field');
+    await placeOneApple(apple, 'L');
+    const s2 = await snap();
+    assert(s2.counts.left === 1 && s2.counts.right === 0, `counts L1/R0, got ${s2.counts.left}/${s2.counts.right}`);
+    const placed = s2.apples.find(a => a.id === apple.id);
+    assert(placed.state === 'plate' && placed.plate === 'L', 'apple is child of plate L');
+    await waitFor(async () => (await snap()).balance.target < 0, 'target tilts left (angle>0 = right down)');
+  });
+
+  await test('drop outside plate: falls to ground, no penalty, still usable', async () => {
+    const s = await snap();
+    const apple = s.apples.find(a => a.state === 'field');
+    const before = s.problemLog.dropOutside;
+    await drag({ x: apple.x, y: apple.y }, { x: 512, y: 180 }); // 皿から遠い中空で放す
+    const g = await waitFor(async () => {
+      const st = await snap();
+      const a = st.apples.find(x => x.id === apple.id);
+      return (a.state === 'ground' || a.state === 'field') && a.y > 300 ? a : null;
+    }, 'apple falls and rests on ground');
+    const s2 = await snap();
+    const after = s2.problemLog.dropOutside;
+    assert(after === before + 1, `dropOutside ${before}->${after}`);
+    await placeOneApple(g, 'R'); // ペナルティなし: そのまま拾って載せられる
+    const s3 = await snap();
+    assert(s3.counts.right === 1, 'ground apple can still be placed');
+  });
+
+  await test('remove from plate: reversible + removedFromPlate count', async () => {
+    const s = await snap();
+    const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === 'L');
+    const before = s.problemLog.removedFromPlate;
+    await drag({ x: onPlate.x, y: onPlate.y }, { x: 512, y: 200 });
+    await waitFor(async () => {
+      const st = await snap();
+      return st.counts.left === 0;
+    }, 'apple removed from plate L');
+    const s2 = await snap();
+    const after = s2.problemLog.removedFromPlate;
+    assert(after === before + 1, `removedFromPlate ${before}->${after}`);
+  });
+
+  await test('problem 0: all on one plate → clamp ±30°, celebrate, auto-advance', async () => {
+    const done = await completeProblem(() => 'R'); // 全部右へ → 差が最大
+    // clamp: 目標角は+30を超えない
+    assert(done.balance.target <= 30.0001 && done.balance.target > 0, `target clamped to +30, got ${done.balance.target}`);
+    assert(done.celebrationType === 'right', `celebrationType right, got ${done.celebrationType}`);
+    await waitForProblem(1);
+  });
+
+  await test('problem 1: split by side, heavier side celebrates', async () => {
+    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.celebrationType ? st : null;
+    }, 'celebrationType set');
+    const expected = s.counts.left === s.counts.right ? 'balance' : (s.counts.left > s.counts.right ? 'left' : 'right');
+    assert(s.celebrationType === expected, `celebration=${expected}, got ${s.celebrationType}`);
+    await waitForProblem(2);
+  });
+
+  await test('problem 2: completes', async () => {
+    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
+    await waitForProblem(3);
+  });
+
+  await test('problem 3 (5v5): balance celebration fires', async () => {
+    const s = await snap();
+    const lv = s.levels[3];
+    assert(lv.left === lv.right, 'level 3 is the equal-count level');
+    // 明示的に5個ずつ載せる（散布位置に依らず同数を保証）
+    let toL = lv.left;
+    await completeProblem(() => (toL-- > 0 ? 'L' : 'R'));
+    const st = await waitFor(async () => {
+      const x = await snap();
+      return x.celebrationType ? x : null;
+    }, 'celebrationType set');
+    assert(st.counts.left === st.counts.right, `equal counts, got ${st.counts.left}/${st.counts.right}`);
+    assert(st.celebrationType === 'balance', `celebrationType balance, got ${st.celebrationType}`);
+    await waitForProblem(4);
+  });
+
+  await test('problem 4: completes → session end', async () => {
+    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
+    await waitFor(async () => (await snap()).phase === 'sessionEnd', 'session end screen', 60_000);
+  });
+
+  await test('logs: schema + values persisted at completion', async () => {
+    const logs = await readLogs();
+    assert(logs.length >= 1, `>=1 session logged, got ${logs.length}`);
+    const sess = logs[logs.length - 1];
+    assert(sess.completed === true, 'completed=true');
+    assert(typeof sess.sessionStart === 'string' && !Number.isNaN(Date.parse(sess.sessionStart)), 'sessionStart is ISO string');
+    assert(Array.isArray(sess.problems) && sess.problems.length === 5, `5 problems, got ${sess.problems?.length}`);
+    sess.problems.forEach((p, i) => {
+      assert(p.level === i, `problem ${i} level index`);
+      assert(typeof p.firstTouchMs === 'number' && p.firstTouchMs >= 0, `firstTouchMs number (p${i})`);
+      assert(typeof p.durationMs === 'number' && p.durationMs > 0, `durationMs > 0 (p${i})`);
+      assert(typeof p.dropOutside === 'number' && typeof p.removedFromPlate === 'number', `counters numeric (p${i})`);
+    });
+    assert(sess.problems[0].dropOutside >= 1, 'dropOutside recorded in problem 0');
+    assert(sess.problems[0].removedFromPlate >= 1, 'removedFromPlate recorded in problem 0');
+  });
+
+  // --- 監査所見4: 終了画面でも親メニューに到達できる（誤リスタートしない） ---
+  await test('sessionEnd: corner long-press opens menu, no accidental restart', async () => {
+    const c = await toClient(28, 28);
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+    await page.mouse.up();
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.menuOpen ? st : null;
+    }, 'menu opens at sessionEnd (not restart)', 5_000);
+    assert(s.phase === 'sessionEnd', `phase stays sessionEnd, got ${s.phase}`);
+    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+    assert((await snap()).phase === 'sessionEnd', 'closing menu does not restart');
+  });
+
+  await test('retry: tap on end screen restarts session, retried=true', async () => {
+    await tap({ x: 512, y: 384 });
+    await waitForProblem(0);
+    const logs = await readLogs();
+    const completedSessions = logs.filter(s => s.completed);
+    assert(completedSessions.length >= 1 && completedSessions[completedSessions.length - 1].retried === true,
+      'previous completed session marked retried');
+  });
+
+  await test('persistence: logs survive reload', async () => {
+    await page.reload();
+    await waitFor(snap, '__tenbin after reload', 10_000);
+    const logs = await readLogs();
+    assert(logs.some(s => s.completed === true), 'completed session persists after reload');
+  });
+
+  await test('orientation: portrait shows rotate prompt, landscape restores', async () => {
+    await page.setViewportSize({ width: 700, height: 1000 });
+    await waitFor(async () => (await snap()).orientationBlocked === true, 'portrait blocked', 5_000);
+    await page.setViewportSize({ width: 1280, height: 960 });
+    await waitFor(async () => (await snap()).orientationBlocked === false, 'landscape restored', 5_000);
+  });
+
+  await test('no text outside parent menu (fillText/strokeText guard)', async () => {
+    const rec = await page.evaluate(() => window.__textViolations);
+    assert(rec.violations === 0, `text drawn outside menu: ${rec.violations} calls, samples=${JSON.stringify(rec.samples)}`);
+  });
+
+  await test('parent menu: 2s long-press opens; clear wipes logs; close', async () => {
+    const c = await toClient(28, 28);
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400)); // 2s(シミュ時間)＋余裕
+    await page.mouse.up();
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.menuOpen ? st : null;
+    }, 'menu opens after long-press', 5_000);
+    assert(s.menuRegions && s.menuRegions.copy && s.menuRegions.clear && s.menuRegions.close, 'menu regions exposed');
+    // コピー（クリップボード権限は付与済み。失敗してもクラッシュしないこと）
+    await tap({ x: s.menuRegions.copy.x + s.menuRegions.copy.w / 2, y: s.menuRegions.copy.y + s.menuRegions.copy.h / 2 });
+    await new Promise(r => setTimeout(r, 300));
+    // 全消去
+    await tap({ x: s.menuRegions.clear.x + s.menuRegions.clear.w / 2, y: s.menuRegions.clear.y + s.menuRegions.clear.h / 2 });
+    await waitFor(async () => (await readLogs()).length === 0, 'logs cleared', 5_000);
+    // 閉じる
+    const s2 = await snap();
+    await tap({ x: s2.menuRegions.close.x + s2.menuRegions.close.w / 2, y: s2.menuRegions.close.y + s2.menuRegions.close.h / 2 });
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  // --- 監査所見3: 破損した保存データ（非オブジェクト要素）でもメニューが死なない ---
+  await test('resilience: corrupted tenbin_logs entries do not freeze menu', async () => {
+    // 保存データの注入（テスト入力。内部状態の直書きではない）
+    await page.evaluate(() => localStorage.setItem('tenbin_logs', '[null,{"completed":true},42,"x"]'));
+    await page.reload();
+    await waitFor(snap, '__tenbin after corrupt-logs reload', 10_000);
+    const c = await toClient(28, 28);
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+    await page.mouse.up();
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.menuOpen ? st : null;
+    }, 'menu opens with corrupted logs (no freeze)', 5_000);
+    const clean = await readLogs();
+    assert(clean.every(x => x && typeof x === 'object' && !Array.isArray(x)),
+      `logs sanitized to objects, got ${JSON.stringify(clean)}`);
+    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  await test('no page errors during entire run', async () => {
+    assert(pageErrors.length === 0, `errors: ${pageErrors.slice(0, 5).join(' | ')}`);
+  });
+
+  await browser.close();
+  server.close();
+
+  const failed = results.filter(r => !r.ok);
+  console.log(`\n${results.length - failed.length}/${results.length} passed`);
+  if (failed.length) {
+    console.log('failed:');
+    for (const f of failed) console.log(`  - ${f.name}: ${f.err.message}`);
+    process.exit(1);
+  }
+})().catch(e => { console.error(e); process.exit(1); });

@@ -1,0 +1,1277 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>てんびん</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#bfe7ff">
+<meta name="format-detection" content="telephone=no">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #10131a; overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
+  }
+  canvas {
+    position: fixed; left: 0; top: 0;
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+
+// ==== SECTION: config ====
+var LOGICAL_W = 1024, LOGICAL_H = 768;
+var FIXED_DT = 1 / 120;
+var MAX_STEPS_PER_FRAME = 240;
+
+var LEVELS = [
+  { left: 2, right: 5, scatter: 0.2 },
+  { left: 4, right: 3, scatter: 0.3 },
+  { left: 5, right: 4, scatter: 0.7 },
+  { left: 5, right: 5, scatter: 0.6 },
+  { left: 7, right: 6, scatter: 0.8 }
+];
+
+var PIVOT = { x: 512, y: 300 };
+var ARM_LEN = 230;
+var ROD_LEN = 90;
+var PLATE_SNAP_R = 120;
+var APPLE_R = 26;
+var APPLE_TOUCH_R = 62;
+var GROUND_Y = 700;
+var GRAVITY = 1000;
+var FOLLOW_RATE = -Math.log(1 - 0.4) * 60; // per-second lerp rate equivalent to 0.4/frame@60fps
+
+var LEFT_ZONE = { x: 70, y: 108, w: 330, h: 172 };
+var RIGHT_ZONE = { x: 624, y: 108, w: 330, h: 172 };
+var BEAR_POS = { x: 190, y: 660 };
+var RABBIT_POS = { x: 834, y: 660 };
+
+// spring-damper tuning: theta'' = k(target-theta) - c*theta'  (degrees)
+// zeta = c/(2*sqrt(k)) ~= 0.42 -> underdamped, ~1-2 visible oscillations then settle
+var SPRING_K = 90;
+var SPRING_C = 8;
+var EPS_VEL = 3;      // deg/s
+var EPS_ANGLE = 0.6;  // deg
+var SETTLE_MS = 1000;
+var TRANSITION_MS = 1500;
+var LONGPRESS_MS = 2000;
+var CORNER_ZONE = { x: 0, y: 0, w: 90, h: 90 };
+
+var MENU_PANEL = { x: 212, y: 170, w: 600, h: 420 };
+var MENU_RECTS = {
+  copy: { x: 262, y: 430, w: 220, h: 74 },
+  clear: { x: 542, y: 430, w: 220, h: 74 },
+  close: { x: 472, y: 526, w: 80, h: 56 }
+};
+
+// ==== SECTION: rng ====
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+var qs = new URLSearchParams(window.location.search);
+var seedParam = qs.get('seed');
+var seed = (seedParam !== null && !isNaN(parseInt(seedParam, 10)))
+  ? (parseInt(seedParam, 10) >>> 0)
+  : ((Date.now() ^ Math.floor(Math.random() * 0xFFFFFFFF)) >>> 0);
+var rng = mulberry32(seed);
+
+var tsParam = parseFloat(qs.get('timescale'));
+var timescale = (isFinite(tsParam) && tsParam > 0) ? tsParam : 1;
+
+// ==== SECTION: audio ====
+var audioCtx = null, masterGain = null, creakOsc = null, creakFilter = null, creakGain = null;
+
+function ensureAudio() {
+  if (audioCtx) {
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    return;
+  }
+  try {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.5;
+    masterGain.connect(audioCtx.destination);
+    setupCreak();
+  } catch (e) {
+    audioCtx = null;
+  }
+}
+
+function setupCreak() {
+  try {
+    creakOsc = audioCtx.createOscillator();
+    creakOsc.type = 'sawtooth';
+    creakOsc.frequency.value = 70;
+    creakFilter = audioCtx.createBiquadFilter();
+    creakFilter.type = 'lowpass';
+    creakFilter.frequency.value = 350;
+    creakGain = audioCtx.createGain();
+    creakGain.gain.value = 0;
+    creakOsc.connect(creakFilter);
+    creakFilter.connect(creakGain);
+    creakGain.connect(masterGain);
+    creakOsc.start();
+  } catch (e) {}
+}
+
+function updateCreak(angVelDegPerSec) {
+  if (!audioCtx || !creakGain) return;
+  try {
+    var mag = Math.min(1, Math.abs(angVelDegPerSec) / 40);
+    var targetGain = mag > 0.05 ? (0.04 + mag * 0.16) : 0;
+    var now = audioCtx.currentTime;
+    creakGain.gain.setTargetAtTime(targetGain, now, 0.06);
+    creakFilter.frequency.setTargetAtTime(300 + mag * 500, now, 0.1);
+  } catch (e) {}
+}
+
+function playTone(opts) {
+  if (!audioCtx) return;
+  try {
+    var t0 = audioCtx.currentTime + (opts.delay || 0);
+    var dur = opts.dur;
+    var osc = audioCtx.createOscillator();
+    osc.type = opts.type || 'sine';
+    osc.frequency.setValueAtTime(opts.freq, t0);
+    if (opts.freqEnd) osc.frequency.linearRampToValueAtTime(opts.freqEnd, t0 + dur);
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(opts.vol || 0.3, t0 + Math.min(0.02, dur * 0.3));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(t0); osc.stop(t0 + dur + 0.03);
+  } catch (e) {}
+}
+
+function playNoiseBurst(dur, vol, freq) {
+  if (!audioCtx) return;
+  try {
+    var bufSize = Math.max(1, Math.floor(audioCtx.sampleRate * dur));
+    var buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    var filt = audioCtx.createBiquadFilter();
+    filt.type = 'lowpass';
+    filt.frequency.value = freq || 1800;
+    var g = audioCtx.createGain();
+    g.gain.value = vol;
+    src.connect(filt); filt.connect(g); g.connect(masterGain);
+    src.start();
+  } catch (e) {}
+}
+
+function playPluck() { playTone({ freq: 520, freqEnd: 780, dur: 0.09, type: 'sine', vol: 0.22 }); }
+function playPlace() {
+  playTone({ freq: 190, freqEnd: 110, dur: 0.16, type: 'sine', vol: 0.32 });
+  playNoiseBurst(0.05, 0.12, 900);
+}
+function playEat() { playNoiseBurst(0.09, 0.28, 1400); }
+function playFanfare(rainbow) {
+  var notes = rainbow
+    ? [523.25, 659.25, 783.99, 987.77, 1174.66, 1567.98]
+    : [523.25, 659.25, 783.99, 1046.5];
+  for (var i = 0; i < notes.length; i++) {
+    playTone({ freq: notes[i], dur: 0.3, type: 'triangle', vol: 0.2, delay: i * 0.11 });
+  }
+}
+
+// ==== SECTION: entities ====
+// canvas / layout
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var dpr = Math.min(window.devicePixelRatio || 1, 2);
+var layout = { scale: 1, offsetX: 0, offsetY: 0 };
+
+// mutable game state (module scope)
+var phase = 'play'; // 'play' | 'celebrate' | 'transition' | 'sessionEnd'
+var problemIndex = 0;
+var simTimeMs = 0;
+var apples = [];
+var nextAppleId = 1;
+var plateOrder = { L: [], R: [] };
+var plates = { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } };
+var balance = { angle: 0, vel: 0, target: 0 };
+var counts = { left: 0, right: 0 };
+var orientationBlocked = false;
+var menuOpen = false;
+var celebrationType = null;
+var settleTimer = 0;
+var dragApple = null;
+var longPress = null; // {active, x, y, elapsed}
+var activePointerId = null;
+var celebrate = null;
+var transitionState = null;
+var animalBounce = { L: 0, R: 0 };
+var particles = [];
+var problemLog = { startSimMs: 0, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
+var logStorage = loadLogs();
+var session = null;
+
+function makeApple(x, y) {
+  return {
+    id: nextAppleId++,
+    x: x, y: y, r: APPLE_R, state: 'field', plate: null,
+    dragTargetX: x, dragTargetY: y, scale: 1,
+    vx: 0, vy: 0, resting: false,
+    plateLocalX: 0, plateLocalY: 0
+  };
+}
+
+function appleById(id) {
+  for (var i = 0; i < apples.length; i++) if (apples[i].id === id) return apples[i];
+  return null;
+}
+
+// ==== SECTION: levels ====
+function layoutZone(count, zone, scatter) {
+  if (count <= 0) return [];
+  var cols = Math.max(1, Math.min(count, 4));
+  var rows = Math.ceil(count / cols);
+  var cellW = zone.w / cols, cellH = zone.h / rows;
+  var pts = [];
+  for (var i = 0; i < count; i++) {
+    var col = i % cols, row = Math.floor(i / cols);
+    var gx = zone.x + cellW * (col + 0.5);
+    var gy = zone.y + cellH * (row + 0.5);
+    var jitterX = Math.max(0, cellW / 2 - APPLE_R * 0.6) * scatter;
+    var jitterY = Math.max(0, cellH / 2 - APPLE_R * 0.6) * scatter;
+    var jx = (rng() * 2 - 1) * jitterX;
+    var jy = (rng() * 2 - 1) * jitterY;
+    pts.push({ x: gx + jx, y: gy + jy });
+  }
+  relaxPoints(pts, zone);
+  return pts;
+}
+
+function relaxPoints(pts, zone) {
+  var minDist = APPLE_R * 2 + 6;
+  for (var iter = 0; iter < 8; iter++) {
+    for (var i = 0; i < pts.length; i++) {
+      for (var j = i + 1; j < pts.length; j++) {
+        var dx = pts[j].x - pts[i].x, dy = pts[j].y - pts[i].y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 0.001) { d = 0.001; dx = 0.001; dy = 0; }
+        if (d < minDist) {
+          var push = (minDist - d) / 2;
+          var nx = dx / d, ny = dy / d;
+          pts[i].x -= nx * push; pts[i].y -= ny * push;
+          pts[j].x += nx * push; pts[j].y += ny * push;
+        }
+      }
+    }
+    for (var k = 0; k < pts.length; k++) {
+      pts[k].x = Math.min(zone.x + zone.w - APPLE_R, Math.max(zone.x + APPLE_R, pts[k].x));
+      pts[k].y = Math.min(zone.y + zone.h - APPLE_R, Math.max(zone.y + APPLE_R, pts[k].y));
+    }
+  }
+}
+
+function generateLevelApples(idx) {
+  var def = LEVELS[idx];
+  var flip = rng() < 0.5;
+  var leftCount = flip ? def.right : def.left;
+  var rightCount = flip ? def.left : def.right;
+  var scatter = def.scatter;
+  var list = [];
+  var leftPos = layoutZone(leftCount, LEFT_ZONE, scatter);
+  var rightPos = layoutZone(rightCount, RIGHT_ZONE, scatter);
+  var i;
+  for (i = 0; i < leftPos.length; i++) list.push(makeApple(leftPos[i].x, leftPos[i].y));
+  for (i = 0; i < rightPos.length; i++) list.push(makeApple(rightPos[i].x, rightPos[i].y));
+  return list;
+}
+
+function startProblem(idx) {
+  dragApple = null; // 遷移をまたいで旧問題のりんごを持ち越さない
+  apples = generateLevelApples(idx); // id はセッション通しで一意（リセットしない）
+  plateOrder = { L: [], R: [] };
+  balance.angle = 0; balance.vel = 0; balance.target = 0;
+  settleTimer = 0;
+  celebrationType = null;
+  problemLog = { startSimMs: simTimeMs, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
+  // 導出状態（皿座標）もこの瞬間に確定させる。最初の物理ステップまでの間に
+  // 入力・読み取りが来ても未初期化値 (0,0) を晒さない
+  computePlates();
+}
+
+// ==== SECTION: logging ====
+function loadLogs() {
+  try {
+    var raw = localStorage.getItem('tenbin_logs');
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // 破損データ耐性: 非オブジェクト要素は捨てる（falsy 安全）
+    return parsed.filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); });
+  } catch (e) { return []; }
+}
+function persistLogs() {
+  try { localStorage.setItem('tenbin_logs', JSON.stringify(logStorage)); } catch (e) {}
+}
+function startNewSession() {
+  session = { sessionStart: new Date().toISOString(), completed: false, retried: false, problems: [] };
+  logStorage.push(session);
+  persistLogs();
+}
+function finalizeProblem() {
+  var rec = {
+    level: problemIndex,
+    firstTouchMs: problemLog.firstTouchSimMs !== null
+      ? Math.round(problemLog.firstTouchSimMs - problemLog.startSimMs) : 0,
+    durationMs: Math.round(simTimeMs - problemLog.startSimMs),
+    dropOutside: problemLog.dropOutside,
+    removedFromPlate: problemLog.removedFromPlate
+  };
+  session.problems.push(rec);
+  if (problemIndex >= LEVELS.length - 1) session.completed = true;
+  persistLogs();
+  celebrationType = counts.left > counts.right ? 'left' : (counts.right > counts.left ? 'right' : 'balance');
+  phase = 'celebrate';
+  celebrateInit();
+}
+function requestRestart() {
+  if (session) { session.retried = true; persistLogs(); }
+  startNewSession();
+  problemIndex = 0;
+  startProblem(0);
+  phase = 'play';
+}
+
+// ==== SECTION: physics ====
+function computePlates() {
+  var rad = balance.angle * Math.PI / 180;
+  var cos = Math.cos(rad), sin = Math.sin(rad);
+  var lex = PIVOT.x + (-ARM_LEN * cos);
+  var ley = PIVOT.y + (-ARM_LEN * sin);
+  var rex = PIVOT.x + (ARM_LEN * cos);
+  var rey = PIVOT.y + (ARM_LEN * sin);
+  plates.L.x = lex; plates.L.y = ley + ROD_LEN;
+  plates.R.x = rex; plates.R.y = rey + ROD_LEN;
+  plates._lex = lex; plates._ley = ley; plates._rex = rex; plates._rey = rey;
+}
+
+function reflowPlate(side) {
+  var order = plateOrder[side];
+  for (var idx = 0; idx < order.length; idx++) {
+    var a = appleById(order[idx]);
+    if (!a) continue;
+    var col = idx % 3, row = Math.floor(idx / 3);
+    a.plateLocalX = (col - 1) * 36;
+    a.plateLocalY = -8 - row * 30;
+  }
+}
+
+function removeFromPlate(a) {
+  var side = a.plate;
+  a.plate = null;
+  var arr = plateOrder[side];
+  if (!arr) return; // 既に皿から外れている（二重解除に耐える）
+  var i = arr.indexOf(a.id);
+  if (i >= 0) arr.splice(i, 1);
+  reflowPlate(side);
+}
+
+function snapToPlate(a, side) {
+  a.state = 'plate';
+  a.plate = side;
+  a.scale = 1;
+  plateOrder[side].push(a.id);
+  reflowPlate(side);
+  var impulse = 34 + rng() * 10;
+  balance.vel += side === 'R' ? impulse : -impulse;
+  playPlace();
+}
+
+function updateGroundApple(a, dt) {
+  if (a.resting) return;
+  a.vy += GRAVITY * dt;
+  a.x += a.vx * dt;
+  a.y += a.vy * dt;
+  if (a.x < APPLE_R + 10) { a.x = APPLE_R + 10; a.vx = -a.vx * 0.4; }
+  if (a.x > LOGICAL_W - APPLE_R - 10) { a.x = LOGICAL_W - APPLE_R - 10; a.vx = -a.vx * 0.4; }
+  if (a.y >= GROUND_Y) {
+    a.y = GROUND_Y;
+    if (Math.abs(a.vy) > 30) { a.vy = -a.vy * 0.35; a.vx *= 0.6; }
+    else { a.vy = 0; a.vx = 0; a.resting = true; }
+  }
+}
+
+function allPlaced() {
+  if (apples.length === 0) return false;
+  for (var i = 0; i < apples.length; i++) if (apples[i].state !== 'plate') return false;
+  return true;
+}
+
+function updateSettle(dt) {
+  if (!allPlaced()) { settleTimer = 0; return; }
+  if (Math.abs(balance.vel) < EPS_VEL && Math.abs(balance.angle - balance.target) < EPS_ANGLE) {
+    settleTimer += dt * 1000;
+    if (settleTimer >= SETTLE_MS) finalizeProblem();
+  } else {
+    settleTimer = 0;
+  }
+}
+
+function celebrateInit() {
+  celebrate = {
+    biteTimer: 0, biteInterval: 380, stage: 'biting',
+    queueL: (celebrationType === 'balance' || celebrationType === 'left') ? plateOrder.L.slice() : [],
+    queueR: (celebrationType === 'balance' || celebrationType === 'right') ? plateOrder.R.slice() : [],
+    finaleTimer: 0, finaleDone: false
+  };
+}
+
+function eatApple(id, side) {
+  var a = appleById(id);
+  // 発火時に前提を再検証: 皿に載っていないりんご（つままれた・処理済み）は食べない
+  if (!a || a.state !== 'plate') return;
+  a.state = 'eaten';
+  playEat();
+  animalBounce[side] = 320;
+  removeFromPlate(a);
+}
+
+function spawnCelebrationParticles() {
+  var cx = (plates.L.x + plates.R.x) / 2;
+  var cy = Math.min(plates.L.y, plates.R.y) - 40;
+  if (celebrationType === 'balance') spawnRainbowParticles(cx, cy, 46);
+  else spawnStarParticles(cx, cy, 30);
+}
+
+function updateCelebrate(dt) {
+  if (!celebrate) return;
+  if (celebrate.stage === 'biting') {
+    celebrate.biteTimer += dt * 1000;
+    if (celebrate.biteTimer >= celebrate.biteInterval) {
+      celebrate.biteTimer = 0;
+      var bit = false;
+      if (celebrate.queueL.length) { eatApple(celebrate.queueL.shift(), 'L'); bit = true; }
+      if (celebrate.queueR.length) { eatApple(celebrate.queueR.shift(), 'R'); bit = true; }
+      if (!bit) celebrate.stage = 'finale';
+    }
+  } else if (celebrate.stage === 'finale') {
+    if (!celebrate.finaleDone) {
+      celebrate.finaleDone = true;
+      spawnCelebrationParticles();
+      playFanfare(celebrationType === 'balance');
+    }
+    celebrate.finaleTimer += dt * 1000;
+    if (celebrate.finaleTimer >= 1400) celebrate.stage = 'done';
+  } else if (celebrate.stage === 'done') {
+    advanceAfterCelebration();
+  }
+}
+
+function advanceAfterCelebration() {
+  celebrate = null;
+  celebrationType = null;
+  if (problemIndex >= LEVELS.length - 1) {
+    phase = 'sessionEnd';
+  } else {
+    phase = 'transition';
+    transitionState = { timer: 0, swapped: false };
+  }
+}
+
+function updateTransition(dt) {
+  transitionState.timer += dt * 1000;
+  if (!transitionState.swapped && transitionState.timer >= TRANSITION_MS / 2) {
+    transitionState.swapped = true;
+    problemIndex++;
+    startProblem(problemIndex);
+  }
+  if (transitionState.timer >= TRANSITION_MS) {
+    phase = 'play';
+    transitionState = null;
+  }
+}
+
+function updateLongPress(dt) {
+  if (longPress && longPress.active) {
+    longPress.elapsed += dt * 1000;
+    if (longPress.elapsed >= LONGPRESS_MS) {
+      menuOpen = true;
+      longPress.active = false;
+    }
+  }
+}
+
+function updatePhysics(dt) {
+  counts.left = 0; counts.right = 0;
+  for (var i = 0; i < apples.length; i++) {
+    if (apples[i].state === 'plate') {
+      if (apples[i].plate === 'L') counts.left++; else counts.right++;
+    }
+  }
+  balance.target = Math.max(-30, Math.min(30, (counts.right - counts.left) * 6));
+  var accel = SPRING_K * (balance.target - balance.angle) - SPRING_C * balance.vel;
+  balance.vel += accel * dt;
+  balance.angle += balance.vel * dt;
+  computePlates();
+
+  for (i = 0; i < apples.length; i++) {
+    var a = apples[i];
+    if (a.state === 'drag') {
+      var rate = 1 - Math.exp(-FOLLOW_RATE * dt);
+      a.x += (a.dragTargetX - a.x) * rate;
+      a.y += (a.dragTargetY - a.y) * rate;
+    } else if (a.state === 'ground') {
+      updateGroundApple(a, dt);
+    } else if (a.state === 'plate') {
+      a.x = plates[a.plate].x + a.plateLocalX;
+      a.y = plates[a.plate].y + a.plateLocalY;
+    }
+  }
+
+  if (phase === 'play') updateSettle(dt);
+  else if (phase === 'celebrate') updateCelebrate(dt);
+  else if (phase === 'transition') updateTransition(dt);
+
+  if (animalBounce.L > 0) animalBounce.L = Math.max(0, animalBounce.L - dt * 1000);
+  if (animalBounce.R > 0) animalBounce.R = Math.max(0, animalBounce.R - dt * 1000);
+
+  updateParticles(dt);
+  updateCreak(balance.vel);
+}
+
+// ==== SECTION: particles ====
+function spawnStarParticles(x, y, count) {
+  for (var i = 0; i < count; i++) {
+    var ang = rng() * Math.PI * 2;
+    var spd = 60 + rng() * 160;
+    particles.push({
+      shape: 'star', x: x, y: y,
+      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 60,
+      age: 0, life: 700 + rng() * 500,
+      size: 6 + rng() * 8,
+      hue: 46 + rng() * 20
+    });
+  }
+}
+function spawnRainbowParticles(x, y, count) {
+  for (var i = 0; i < count; i++) {
+    var ang = (i / count) * Math.PI * 2 + rng() * 0.3;
+    var spd = 70 + rng() * 190;
+    particles.push({
+      shape: 'circle', x: x, y: y,
+      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 40,
+      age: 0, life: 900 + rng() * 700,
+      size: 5 + rng() * 7,
+      hue: (i / count) * 360
+    });
+  }
+}
+function updateParticles(dt) {
+  var out = [];
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i];
+    p.vy += 260 * dt * 0.35;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.age += dt * 1000;
+    if (p.age < p.life) out.push(p);
+  }
+  particles = out;
+}
+
+// ==== SECTION: input ====
+function logicalFromClient(clientX, clientY) {
+  var rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left - layout.offsetX) / layout.scale,
+    y: (clientY - rect.top - layout.offsetY) / layout.scale
+  };
+}
+
+function appleWorldPos(a) {
+  return { x: a.x, y: a.y };
+}
+
+function findDraggableApple(x, y) {
+  var best = null, bestD = Infinity;
+  for (var i = 0; i < apples.length; i++) {
+    var a = apples[i];
+    if (a.state !== 'field' && a.state !== 'ground' && a.state !== 'plate') continue;
+    var p = appleWorldPos(a);
+    var dx = p.x - x, dy = p.y - y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d <= APPLE_TOUCH_R && d < bestD) { best = a; bestD = d; }
+  }
+  return best;
+}
+
+function inCornerZone(x, y) {
+  return x >= CORNER_ZONE.x && x <= CORNER_ZONE.x + CORNER_ZONE.w &&
+         y >= CORNER_ZONE.y && y <= CORNER_ZONE.y + CORNER_ZONE.h;
+}
+
+function startDragApple(a, x, y) {
+  if (a.state === 'plate') {
+    removeFromPlate(a);
+    problemLog.removedFromPlate++;
+  }
+  a.state = 'drag';
+  a.dragTargetX = x; a.dragTargetY = y;
+  a.scale = 1.15;
+  playPluck();
+  dragApple = a;
+  if (problemLog.firstTouchSimMs === null) problemLog.firstTouchSimMs = simTimeMs;
+}
+
+function releaseDragApple(x, y) {
+  var a = dragApple;
+  if (!a) return;
+  var dL = Math.hypot(x - plates.L.x, y - plates.L.y);
+  var dR = Math.hypot(x - plates.R.x, y - plates.R.y);
+  a.scale = 1;
+  if (dL <= PLATE_SNAP_R && dL <= dR) {
+    snapToPlate(a, 'L');
+  } else if (dR <= PLATE_SNAP_R) {
+    snapToPlate(a, 'R');
+  } else {
+    a.state = 'ground';
+    a.resting = false;
+    a.vx = (rng() * 2 - 1) * 60;
+    a.vy = -60;
+    problemLog.dropOutside++;
+  }
+  dragApple = null;
+}
+
+function menuPointerDown(x, y) {
+  function hit(r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  if (hit(MENU_RECTS.copy)) { copyLogsToClipboard(); return; }
+  if (hit(MENU_RECTS.clear)) { clearLogs(); return; }
+  if (hit(MENU_RECTS.close)) { menuOpen = false; return; }
+  var inPanel = x >= MENU_PANEL.x && x <= MENU_PANEL.x + MENU_PANEL.w &&
+                y >= MENU_PANEL.y && y <= MENU_PANEL.y + MENU_PANEL.h;
+  if (!inPanel) menuOpen = false;
+}
+
+function handlePointerDown(x, y) {
+  ensureAudio();
+  if (menuOpen) { menuPointerDown(x, y); return; }
+  if (orientationBlocked) return;
+  // 隅の長押しはりんごより優先（判定円の重なりで作用先が曖昧にならないように）。
+  // sessionEnd 画面でも親メニューへ到達できる
+  if (inCornerZone(x, y)) { longPress = { active: true, x: x, y: y, elapsed: 0 }; return; }
+  if (phase === 'sessionEnd') { requestRestart(); return; }
+  // 演出・遷移中はドラッグ開始不可（食べキュー・問題差し替えと競合させない）
+  if (phase !== 'play') return;
+  var a = findDraggableApple(x, y);
+  if (a) { startDragApple(a, x, y); }
+}
+function handlePointerMove(x, y) {
+  if (dragApple) { dragApple.dragTargetX = x; dragApple.dragTargetY = y; return; }
+  if (longPress && longPress.active) {
+    if (Math.hypot(x - longPress.x, y - longPress.y) > 24) longPress.active = false;
+  }
+}
+function handlePointerUp(x, y) {
+  if (dragApple) { releaseDragApple(x, y); }
+  longPress = null;
+}
+
+function bindInput() {
+  canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    if (activePointerId !== null) return;
+    var t = e.changedTouches[0];
+    activePointerId = t.identifier;
+    var p = logicalFromClient(t.clientX, t.clientY);
+    handlePointerDown(p.x, p.y);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    for (var i = 0; i < e.changedTouches.length; i++) {
+      var t = e.changedTouches[i];
+      if (t.identifier === activePointerId) {
+        var p = logicalFromClient(t.clientX, t.clientY);
+        handlePointerMove(p.x, p.y);
+      }
+    }
+  }, { passive: false });
+  function touchEnd(e) {
+    e.preventDefault();
+    for (var i = 0; i < e.changedTouches.length; i++) {
+      var t = e.changedTouches[i];
+      if (t.identifier === activePointerId) {
+        var p = logicalFromClient(t.clientX, t.clientY);
+        handlePointerUp(p.x, p.y);
+        activePointerId = null;
+      }
+    }
+  }
+  canvas.addEventListener('touchend', touchEnd, { passive: false });
+  canvas.addEventListener('touchcancel', touchEnd, { passive: false });
+
+  canvas.addEventListener('mousedown', function (e) {
+    if (activePointerId !== null) return;
+    activePointerId = 'mouse';
+    var p = logicalFromClient(e.clientX, e.clientY);
+    handlePointerDown(p.x, p.y);
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (activePointerId !== 'mouse') return;
+    var p = logicalFromClient(e.clientX, e.clientY);
+    handlePointerMove(p.x, p.y);
+  });
+  window.addEventListener('mouseup', function (e) {
+    if (activePointerId !== 'mouse') return;
+    var p = logicalFromClient(e.clientX, e.clientY);
+    handlePointerUp(p.x, p.y);
+    activePointerId = null;
+  });
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+}
+
+// ==== SECTION: menu ====
+var menuFlash = { copy: 0, clear: 0 };
+
+function copyLogsToClipboard() {
+  var text = JSON.stringify(logStorage);
+  function ok() { menuFlash.copy = 900; }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, function () { fallbackCopy(text, ok); });
+    } else {
+      fallbackCopy(text, ok);
+    }
+  } catch (e) {
+    fallbackCopy(text, ok);
+  }
+}
+function fallbackCopy(text, ok) {
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    ok();
+  } catch (e) {}
+}
+function clearLogs() {
+  // 消去は消去だけ行う。進行中の session はストレージから切り離されたまま続行し、
+  // 以後の persistLogs() で復活しない（次の startNewSession から記録再開）
+  logStorage = [];
+  persistLogs();
+  menuFlash.clear = 900;
+}
+
+function computeStats() {
+  var sessions = logStorage.length;
+  var completed = 0, retried = 0;
+  for (var i = 0; i < logStorage.length; i++) {
+    var s = logStorage[i];
+    if (!s || typeof s !== 'object') continue;
+    if (s.completed) completed++;
+    if (s.retried) retried++;
+  }
+  return {
+    sessions: sessions,
+    completeRate: sessions ? completed / sessions : 0,
+    retryRate: completed ? retried / completed : 0
+  };
+}
+
+function drawMenu(c) {
+  c.save();
+  c.fillStyle = 'rgba(10,14,22,0.55)';
+  c.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  roundRect(c, MENU_PANEL.x, MENU_PANEL.y, MENU_PANEL.w, MENU_PANEL.h, 24);
+  c.fillStyle = '#fbfaf5';
+  c.fill();
+  c.strokeStyle = '#d8d2c0';
+  c.lineWidth = 2;
+  c.stroke();
+
+  var stats = computeStats();
+  c.fillStyle = '#333';
+  c.textAlign = 'left';
+  c.textBaseline = 'alphabetic';
+  c.font = '22px sans-serif';
+  c.fillText('親メニュー', MENU_PANEL.x + 30, MENU_PANEL.y + 44);
+  c.font = '16px sans-serif';
+  c.fillText('セッション数: ' + stats.sessions, MENU_PANEL.x + 30, MENU_PANEL.y + 90);
+  c.fillText('完走率: ' + Math.round(stats.completeRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 120);
+  c.fillText('もう1回率: ' + Math.round(stats.retryRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 150);
+
+  drawMenuButton(c, MENU_RECTS.copy, menuFlash.copy > 0 ? 'コピーしました' : 'ログをコピー');
+  drawMenuButton(c, MENU_RECTS.clear, menuFlash.clear > 0 ? '消去しました' : 'ログを消去');
+  drawMenuButton(c, MENU_RECTS.close, '閉じる');
+
+  c.restore();
+  if (menuFlash.copy > 0) menuFlash.copy -= 16;
+  if (menuFlash.clear > 0) menuFlash.clear -= 16;
+}
+function drawMenuButton(c, r, label) {
+  roundRect(c, r.x, r.y, r.w, r.h, 14);
+  c.fillStyle = '#eef1f7';
+  c.fill();
+  c.strokeStyle = '#b9c2d4';
+  c.lineWidth = 2;
+  c.stroke();
+  c.fillStyle = '#333';
+  c.font = '16px sans-serif';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillText(label, r.x + r.w / 2, r.y + r.h / 2);
+}
+
+// ==== SECTION: render ====
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+function updateLayout() {
+  var w = window.innerWidth, h = window.innerHeight;
+  var scale = Math.min(w / LOGICAL_W, h / LOGICAL_H);
+  var offsetX = (w - LOGICAL_W * scale) / 2;
+  var offsetY = (h - LOGICAL_H * scale) / 2;
+  layout.scale = scale; layout.offsetX = offsetX; layout.offsetY = offsetY;
+  var bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw; canvas.height = bh;
+    canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  }
+}
+
+function drawBackground(c) {
+  var g = c.createLinearGradient(0, 0, 0, LOGICAL_H);
+  g.addColorStop(0, '#bfe7ff');
+  g.addColorStop(1, '#fff3d6');
+  c.fillStyle = g;
+  c.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  c.fillStyle = '#cbe8a8';
+  c.fillRect(0, GROUND_Y + 24, LOGICAL_W, LOGICAL_H - GROUND_Y - 24);
+  c.fillStyle = 'rgba(255,255,255,0.6)';
+  c.beginPath(); c.ellipse(150, 90, 60, 22, 0, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.ellipse(230, 100, 40, 16, 0, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.ellipse(860, 70, 70, 24, 0, 0, Math.PI * 2); c.fill();
+}
+
+function drawProgressDots(c) {
+  var n = LEVELS.length;
+  var spacing = 30;
+  var startX = LOGICAL_W / 2 - ((n - 1) * spacing) / 2;
+  for (var i = 0; i < n; i++) {
+    var x = startX + i * spacing, y = 26;
+    var r = i === problemIndex ? 9 : 7;
+    c.beginPath();
+    c.arc(x, y, r, 0, Math.PI * 2);
+    if (i < problemIndex) { c.fillStyle = '#7fc97f'; c.fill(); }
+    else if (i === problemIndex) { c.fillStyle = '#ff9f5a'; c.fill(); }
+    else { c.strokeStyle = '#ffffff'; c.lineWidth = 3; c.stroke(); }
+  }
+}
+
+function drawAppleShape(c, x, y, r, scale) {
+  c.save();
+  c.translate(x, y);
+  c.scale(scale, scale);
+  var g = c.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.2, 0, 0, r);
+  g.addColorStop(0, '#ff8a7a');
+  g.addColorStop(1, '#e0392b');
+  c.beginPath();
+  c.arc(0, 2, r, 0, Math.PI * 2);
+  c.fillStyle = g;
+  c.fill();
+  c.strokeStyle = 'rgba(150,30,20,0.4)';
+  c.lineWidth = 1.5;
+  c.stroke();
+  c.fillStyle = '#7a4a25';
+  c.fillRect(-2, -r - 4, 4, 8);
+  c.beginPath();
+  c.ellipse(6, -r - 2, 6, 3.2, -0.5, 0, Math.PI * 2);
+  c.fillStyle = '#5faa4e';
+  c.fill();
+  c.restore();
+}
+
+function drawFieldApples(c) {
+  for (var i = 0; i < apples.length; i++) {
+    var a = apples[i];
+    if (a.state === 'field' || a.state === 'ground') drawAppleShape(c, a.x, a.y, a.r, a.scale);
+  }
+}
+
+function drawDragApple(c) {
+  if (!dragApple) return;
+  drawAppleShape(c, dragApple.x, dragApple.y, dragApple.r, dragApple.scale);
+}
+
+function drawPlateApples(c, side) {
+  for (var i = 0; i < apples.length; i++) {
+    var a = apples[i];
+    if (a.state === 'plate' && a.plate === side) drawAppleShape(c, a.x, a.y, a.r, a.scale);
+  }
+}
+
+function drawBeamAndPlates(c) {
+  // stand
+  c.fillStyle = '#8a6a45';
+  c.beginPath();
+  c.moveTo(PIVOT.x - 14, GROUND_Y);
+  c.lineTo(PIVOT.x + 14, GROUND_Y);
+  c.lineTo(PIVOT.x + 5, PIVOT.y);
+  c.lineTo(PIVOT.x - 5, PIVOT.y);
+  c.closePath();
+  c.fill();
+
+  var lex = plates._lex, ley = plates._ley, rex = plates._rex, rey = plates._rey;
+  // beam
+  c.strokeStyle = '#7a5a38';
+  c.lineWidth = 10;
+  c.lineCap = 'round';
+  c.beginPath();
+  c.moveTo(lex, ley);
+  c.lineTo(rex, rey);
+  c.stroke();
+  // pivot cap
+  c.beginPath();
+  c.arc(PIVOT.x, PIVOT.y, 10, 0, Math.PI * 2);
+  c.fillStyle = '#5f462b';
+  c.fill();
+
+  // rods
+  c.strokeStyle = '#9a9a9a';
+  c.lineWidth = 3;
+  c.beginPath(); c.moveTo(lex, ley); c.lineTo(plates.L.x, plates.L.y); c.stroke();
+  c.beginPath(); c.moveTo(rex, rey); c.lineTo(plates.R.x, plates.R.y); c.stroke();
+
+  drawPlateDish(c, plates.L.x, plates.L.y);
+  drawPlateDish(c, plates.R.x, plates.R.y);
+  drawPlateApples(c, 'L');
+  drawPlateApples(c, 'R');
+}
+
+function drawPlateDish(c, x, y) {
+  c.beginPath();
+  c.ellipse(x, y, 78, 22, 0, 0, Math.PI * 2);
+  c.fillStyle = '#dfe7ee';
+  c.fill();
+  c.strokeStyle = '#aab5c2';
+  c.lineWidth = 3;
+  c.stroke();
+}
+
+function drawBear(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#8a5a34';
+  c.beginPath(); c.arc(0, -18, 46, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -78, 32, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(-24, -104, 12, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(24, -104, 12, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#c99a6c';
+  c.beginPath(); c.arc(0, -70, 15, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#2c2015';
+  c.beginPath(); c.arc(-10, -82, 3.5, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(10, -82, 3.5, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -66, 4, 0, Math.PI * 2); c.fill();
+  c.restore();
+}
+
+function drawRabbit(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#fbfbfb';
+  c.beginPath(); c.arc(0, -18, 42, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -74, 28, 0, Math.PI * 2); c.fill();
+  c.save();
+  c.translate(-14, -100); c.rotate(-0.12);
+  c.beginPath(); c.ellipse(0, -20, 9, 30, 0, 0, Math.PI * 2); c.fillStyle = '#fbfbfb'; c.fill();
+  c.beginPath(); c.ellipse(0, -18, 4.5, 20, 0, 0, Math.PI * 2); c.fillStyle = '#f4b6c2'; c.fill();
+  c.restore();
+  c.save();
+  c.translate(14, -100); c.rotate(0.12);
+  c.beginPath(); c.ellipse(0, -20, 9, 30, 0, 0, Math.PI * 2); c.fillStyle = '#fbfbfb'; c.fill();
+  c.beginPath(); c.ellipse(0, -18, 4.5, 20, 0, 0, Math.PI * 2); c.fillStyle = '#f4b6c2'; c.fill();
+  c.restore();
+  c.fillStyle = '#2c2015';
+  c.beginPath(); c.arc(-9, -76, 3.2, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(9, -76, 3.2, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#f4b6c2';
+  c.beginPath(); c.arc(0, -66, 3.6, 0, Math.PI * 2); c.fill();
+  c.restore();
+}
+
+function drawAnimals(c) {
+  drawBear(c, BEAR_POS.x, BEAR_POS.y, animalBounce.L);
+  drawRabbit(c, RABBIT_POS.x, RABBIT_POS.y, animalBounce.R);
+}
+
+function drawParticles(c) {
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i];
+    var alpha = Math.max(0, 1 - p.age / p.life);
+    c.save();
+    c.globalAlpha = alpha;
+    c.translate(p.x, p.y);
+    c.fillStyle = 'hsl(' + p.hue + ',85%,60%)';
+    if (p.shape === 'star') drawStarPath(c, p.size);
+    else { c.beginPath(); c.arc(0, 0, p.size, 0, Math.PI * 2); c.fill(); }
+    c.restore();
+  }
+}
+function drawStarPath(c, r) {
+  c.beginPath();
+  for (var i = 0; i < 10; i++) {
+    var ang = (Math.PI / 5) * i - Math.PI / 2;
+    var rad = i % 2 === 0 ? r : r * 0.45;
+    var px = Math.cos(ang) * rad, py = Math.sin(ang) * rad;
+    if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+  }
+  c.closePath();
+  c.fill();
+}
+
+function drawSessionEnd(c) {
+  c.save();
+  c.fillStyle = 'rgba(255,255,255,0.15)';
+  c.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  var cx = LOGICAL_W / 2;
+  for (var i = 0; i < 5; i++) {
+    var x = cx + (i - 2) * 90;
+    var pulse = 1 + Math.sin(simTimeMs / 300 + i) * 0.12;
+    c.save();
+    c.translate(x, 160);
+    c.scale(pulse, pulse);
+    c.fillStyle = '#ffd35a';
+    drawStarPath(c, 26);
+    c.restore();
+  }
+  drawBear(c, BEAR_POS.x, BEAR_POS.y, 320 * (0.5 + Math.sin(simTimeMs / 260) * 0.5));
+  drawRabbit(c, RABBIT_POS.x, RABBIT_POS.y, 320 * (0.5 + Math.cos(simTimeMs / 260) * 0.5));
+  c.restore();
+}
+
+function drawTransitionFade(c) {
+  var t = transitionState.timer;
+  var half = TRANSITION_MS / 2;
+  var alpha = t < half ? (t / half) : (1 - (t - half) / half);
+  c.save();
+  c.globalAlpha = Math.max(0, Math.min(1, alpha));
+  c.fillStyle = '#fff8ea';
+  c.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  c.restore();
+}
+
+function drawRotatePrompt(c) {
+  c.save();
+  c.fillStyle = 'rgba(20,24,32,0.92)';
+  c.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  var cx = LOGICAL_W / 2, cy = LOGICAL_H / 2;
+  var wob = Math.sin(simTimeMs / 500) * 0.18;
+  c.save();
+  c.translate(cx, cy);
+  c.rotate(Math.PI / 2 + wob);
+  roundRect(c, -50, -80, 100, 160, 16);
+  c.fillStyle = '#e8ecf2';
+  c.fill();
+  c.strokeStyle = '#9aa5b5';
+  c.lineWidth = 4;
+  c.stroke();
+  c.beginPath();
+  c.arc(0, 62, 8, 0, Math.PI * 2);
+  c.fillStyle = '#9aa5b5';
+  c.fill();
+  c.restore();
+  c.save();
+  c.translate(cx + 90, cy - 60);
+  c.beginPath();
+  c.arc(0, 0, 30, -0.4, Math.PI * 1.3);
+  c.strokeStyle = '#f0c86a';
+  c.lineWidth = 6;
+  c.lineCap = 'round';
+  c.stroke();
+  c.restore();
+  c.restore();
+}
+
+function render() {
+  updateLayout();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#10131a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(dpr * layout.scale, 0, 0, dpr * layout.scale, dpr * layout.offsetX, dpr * layout.offsetY);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, LOGICAL_W, LOGICAL_H);
+  ctx.clip();
+
+  drawBackground(ctx);
+  if (orientationBlocked) {
+    drawRotatePrompt(ctx);
+  } else {
+    drawProgressDots(ctx);
+    drawFieldApples(ctx);
+    drawBeamAndPlates(ctx);
+    drawAnimals(ctx);
+    drawDragApple(ctx);
+    drawParticles(ctx);
+    if (phase === 'sessionEnd') drawSessionEnd(ctx);
+    if (phase === 'transition' && transitionState) drawTransitionFade(ctx);
+  }
+  if (menuOpen) drawMenu(ctx);
+  ctx.restore();
+}
+
+// ==== SECTION: main loop ====
+function updateOrientation() {
+  orientationBlocked = window.innerWidth < window.innerHeight;
+}
+
+function step(dt) {
+  simTimeMs += dt * 1000;
+  updateOrientation();
+  if (orientationBlocked) { updateCreak(0); return; }
+  updateLongPress(dt);
+  if (menuOpen) return;
+  updatePhysics(dt);
+}
+
+var lastRealTime = null;
+var accumulator = 0;
+
+function frame(nowMs) {
+  // 進行不能への最終防衛線: 例外1つで rAF ループを殺さない。
+  // console.error は検証ハーネスが失敗として検出するので、欠陥は隠れない
+  try {
+    if (lastRealTime === null) lastRealTime = nowMs;
+    var realDt = (nowMs - lastRealTime) / 1000;
+    lastRealTime = nowMs;
+    if (realDt > 0.25) realDt = 0.25;
+    accumulator += realDt * timescale;
+    var steps = 0;
+    while (accumulator >= FIXED_DT && steps < MAX_STEPS_PER_FRAME) {
+      step(FIXED_DT);
+      accumulator -= FIXED_DT;
+      steps++;
+    }
+    if (steps >= MAX_STEPS_PER_FRAME) accumulator = 0; // discard backlog beyond cap (anti spiral-of-death)
+    render();
+  } catch (e) {
+    try { console.error('frame error: ' + (e && e.message)); } catch (_) {}
+    accumulator = 0;
+  }
+  requestAnimationFrame(frame);
+}
+
+// ==== SECTION: test-hooks ====
+function toClientPoint(x, y) {
+  var rect = canvas.getBoundingClientRect();
+  return { x: rect.left + layout.offsetX + x * layout.scale, y: rect.top + layout.offsetY + y * layout.scale };
+}
+
+function installTenbinHook() {
+  var api = {};
+  Object.defineProperties(api, {
+    phase: { enumerable: true, get: function () { return phase; } },
+    problemIndex: { enumerable: true, get: function () { return problemIndex; } },
+    levels: { enumerable: true, get: function () { return LEVELS; } },
+    apples: {
+      enumerable: true, get: function () {
+        return apples.map(function (a) {
+          return { id: a.id, x: a.x, y: a.y, r: a.r, state: a.state, plate: a.plate };
+        });
+      }
+    },
+    plates: {
+      enumerable: true, get: function () {
+        return { L: { x: plates.L.x, y: plates.L.y }, R: { x: plates.R.x, y: plates.R.y } };
+      }
+    },
+    balance: {
+      enumerable: true, get: function () {
+        return { angle: balance.angle, vel: balance.vel, target: balance.target };
+      }
+    },
+    counts: { enumerable: true, get: function () { return { left: counts.left, right: counts.right }; } },
+    orientationBlocked: { enumerable: true, get: function () { return orientationBlocked; } },
+    menuOpen: { enumerable: true, get: function () { return menuOpen; } },
+    menuRegions: {
+      enumerable: true, get: function () {
+        if (!menuOpen) return null;
+        return {
+          copy: { x: MENU_RECTS.copy.x, y: MENU_RECTS.copy.y, w: MENU_RECTS.copy.w, h: MENU_RECTS.copy.h },
+          clear: { x: MENU_RECTS.clear.x, y: MENU_RECTS.clear.y, w: MENU_RECTS.clear.w, h: MENU_RECTS.clear.h },
+          close: { x: MENU_RECTS.close.x, y: MENU_RECTS.close.y, w: MENU_RECTS.close.w, h: MENU_RECTS.close.h }
+        };
+      }
+    },
+    celebrationType: { enumerable: true, get: function () { return celebrationType; } },
+    session: { enumerable: true, get: function () { return session; } },
+    problemLog: {
+      enumerable: true, get: function () {
+        return {
+          dropOutside: problemLog.dropOutside,
+          removedFromPlate: problemLog.removedFromPlate,
+          firstTouched: problemLog.firstTouchSimMs !== null
+        };
+      }
+    },
+    toClient: { enumerable: true, value: toClientPoint }
+  });
+  try {
+    Object.defineProperty(window, '__tenbin', { value: api, writable: false, configurable: false, enumerable: true });
+  } catch (e) {
+    window.__tenbin = api;
+  }
+}
+
+// ==== SECTION: bootstrap ====
+function init() {
+  bindInput();
+  window.addEventListener('resize', function () { updateLayout(); });
+  updateLayout();
+  startNewSession();
+  startProblem(0);
+  phase = 'play';
+  installTenbinHook();
+  requestAnimationFrame(frame);
+}
+
+init();
+
+})();
+</script>
+</body>
+</html>
+
