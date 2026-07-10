@@ -304,8 +304,8 @@ function generateLevelApples(idx) {
 }
 
 function startProblem(idx) {
-  nextAppleId = 1;
-  apples = generateLevelApples(idx);
+  dragApple = null; // 遷移をまたいで旧問題のりんごを持ち越さない
+  apples = generateLevelApples(idx); // id はセッション通しで一意（リセットしない）
   plateOrder = { L: [], R: [] };
   balance.angle = 0; balance.vel = 0; balance.target = 0;
   settleTimer = 0;
@@ -322,7 +322,9 @@ function loadLogs() {
     var raw = localStorage.getItem('tenbin_logs');
     if (!raw) return [];
     var parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    // 破損データ耐性: 非オブジェクト要素は捨てる（falsy 安全）
+    return parsed.filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); });
   } catch (e) { return []; }
 }
 function persistLogs() {
@@ -382,11 +384,13 @@ function reflowPlate(side) {
 }
 
 function removeFromPlate(a) {
-  var arr = plateOrder[a.plate];
+  var side = a.plate;
+  a.plate = null;
+  var arr = plateOrder[side];
+  if (!arr) return; // 既に皿から外れている（二重解除に耐える）
   var i = arr.indexOf(a.id);
   if (i >= 0) arr.splice(i, 1);
-  reflowPlate(a.plate);
-  a.plate = null;
+  reflowPlate(side);
 }
 
 function snapToPlate(a, side) {
@@ -441,7 +445,8 @@ function celebrateInit() {
 
 function eatApple(id, side) {
   var a = appleById(id);
-  if (!a) return;
+  // 発火時に前提を再検証: 皿に載っていないりんご（つままれた・処理済み）は食べない
+  if (!a || a.state !== 'plate') return;
   a.state = 'eaten';
   playEat();
   animalBounce[side] = 320;
@@ -668,11 +673,15 @@ function menuPointerDown(x, y) {
 function handlePointerDown(x, y) {
   ensureAudio();
   if (menuOpen) { menuPointerDown(x, y); return; }
-  if (phase === 'sessionEnd') { requestRestart(); return; }
   if (orientationBlocked) return;
+  // 隅の長押しはりんごより優先（判定円の重なりで作用先が曖昧にならないように）。
+  // sessionEnd 画面でも親メニューへ到達できる
+  if (inCornerZone(x, y)) { longPress = { active: true, x: x, y: y, elapsed: 0 }; return; }
+  if (phase === 'sessionEnd') { requestRestart(); return; }
+  // 演出・遷移中はドラッグ開始不可（食べキュー・問題差し替えと競合させない）
+  if (phase !== 'play') return;
   var a = findDraggableApple(x, y);
-  if (a) { startDragApple(a, x, y); return; }
-  if (inCornerZone(x, y)) { longPress = { active: true, x: x, y: y, elapsed: 0 }; }
+  if (a) { startDragApple(a, x, y); }
 }
 function handlePointerMove(x, y) {
   if (dragApple) { dragApple.dragTargetX = x; dragApple.dragTargetY = y; return; }
@@ -779,8 +788,10 @@ function computeStats() {
   var sessions = logStorage.length;
   var completed = 0, retried = 0;
   for (var i = 0; i < logStorage.length; i++) {
-    if (logStorage[i].completed) completed++;
-    if (logStorage[i].retried) retried++;
+    var s = logStorage[i];
+    if (!s || typeof s !== 'object') continue;
+    if (s.completed) completed++;
+    if (s.retried) retried++;
   }
   return {
     sessions: sessions,
@@ -1160,19 +1171,26 @@ var lastRealTime = null;
 var accumulator = 0;
 
 function frame(nowMs) {
-  if (lastRealTime === null) lastRealTime = nowMs;
-  var realDt = (nowMs - lastRealTime) / 1000;
-  lastRealTime = nowMs;
-  if (realDt > 0.25) realDt = 0.25;
-  accumulator += realDt * timescale;
-  var steps = 0;
-  while (accumulator >= FIXED_DT && steps < MAX_STEPS_PER_FRAME) {
-    step(FIXED_DT);
-    accumulator -= FIXED_DT;
-    steps++;
+  // 進行不能への最終防衛線: 例外1つで rAF ループを殺さない。
+  // console.error は検証ハーネスが失敗として検出するので、欠陥は隠れない
+  try {
+    if (lastRealTime === null) lastRealTime = nowMs;
+    var realDt = (nowMs - lastRealTime) / 1000;
+    lastRealTime = nowMs;
+    if (realDt > 0.25) realDt = 0.25;
+    accumulator += realDt * timescale;
+    var steps = 0;
+    while (accumulator >= FIXED_DT && steps < MAX_STEPS_PER_FRAME) {
+      step(FIXED_DT);
+      accumulator -= FIXED_DT;
+      steps++;
+    }
+    if (steps >= MAX_STEPS_PER_FRAME) accumulator = 0; // discard backlog beyond cap (anti spiral-of-death)
+    render();
+  } catch (e) {
+    try { console.error('frame error: ' + (e && e.message)); } catch (_) {}
+    accumulator = 0;
   }
-  if (steps >= MAX_STEPS_PER_FRAME) accumulator = 0; // discard backlog beyond cap (anti spiral-of-death)
-  render();
   requestAnimationFrame(frame);
 }
 

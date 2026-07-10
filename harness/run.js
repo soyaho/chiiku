@@ -216,6 +216,21 @@ function serve() {
     assert(flips >= 2, `expected >=2 overshoot flips, got ${flips} (angle-target range [${lo}, ${hi}], n=${series.length})`);
   });
 
+  // --- 監査所見1: 演出中に皿のりんごをつまんでもゲームが死なない ---
+  await test('grab during celebration: input gated, game never freezes', async () => {
+    // spring テストの続き（timescale=2、皿にりんご1個載っている状態）。残りを全部載せて演出へ
+    await completeProblem(() => 'R');
+    // 演出中に「まだ食べられていない」皿上のりんごをつまんで外へ捨てようとする
+    // （旧実装: plate から外れた id が食べキューに残り TypeError → rAF ループ恒久停止）
+    const st = await snap();
+    const target = [...st.apples].reverse().find(a => a.state === 'plate');
+    if (target) {
+      await drag({ x: target.x, y: target.y }, { x: 512, y: 200 }, { steps: 4, settleMs: 40 });
+    }
+    // ゲームが生きていて次問へ自動遷移すること（フリーズすればここでタイムアウト）
+    await waitForProblem(1);
+  }, 120_000);
+
   // --- 本編セッション（高速） ---
   await test('boot: play phase, level table, landscape ok', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
@@ -332,6 +347,23 @@ function serve() {
     assert(sess.problems[0].removedFromPlate >= 1, 'removedFromPlate recorded in problem 0');
   });
 
+  // --- 監査所見4: 終了画面でも親メニューに到達できる（誤リスタートしない） ---
+  await test('sessionEnd: corner long-press opens menu, no accidental restart', async () => {
+    const c = await toClient(28, 28);
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+    await page.mouse.up();
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.menuOpen ? st : null;
+    }, 'menu opens at sessionEnd (not restart)', 5_000);
+    assert(s.phase === 'sessionEnd', `phase stays sessionEnd, got ${s.phase}`);
+    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+    assert((await snap()).phase === 'sessionEnd', 'closing menu does not restart');
+  });
+
   await test('retry: tap on end screen restarts session, retried=true', async () => {
     await tap({ x: 512, y: 384 });
     await waitForProblem(0);
@@ -380,6 +412,28 @@ function serve() {
     // 閉じる
     const s2 = await snap();
     await tap({ x: s2.menuRegions.close.x + s2.menuRegions.close.w / 2, y: s2.menuRegions.close.y + s2.menuRegions.close.h / 2 });
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  // --- 監査所見3: 破損した保存データ（非オブジェクト要素）でもメニューが死なない ---
+  await test('resilience: corrupted tenbin_logs entries do not freeze menu', async () => {
+    // 保存データの注入（テスト入力。内部状態の直書きではない）
+    await page.evaluate(() => localStorage.setItem('tenbin_logs', '[null,{"completed":true},42,"x"]'));
+    await page.reload();
+    await waitFor(snap, '__tenbin after corrupt-logs reload', 10_000);
+    const c = await toClient(28, 28);
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+    await page.mouse.up();
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return st.menuOpen ? st : null;
+    }, 'menu opens with corrupted logs (no freeze)', 5_000);
+    const clean = await readLogs();
+    assert(clean.every(x => x && typeof x === 'object' && !Array.isArray(x)),
+      `logs sanitized to objects, got ${JSON.stringify(clean)}`);
+    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
     await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
   });
 
