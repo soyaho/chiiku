@@ -57,7 +57,7 @@ async function snap() {
     return {
       screen: t.screen, game: t.game, menuTiles: t.menuTiles, homeButton: t.homeButton,
       phase: t.phase, round: t.round, apples: t.apples, plates: t.plates, mouths: t.mouths,
-      balance: t.balance, counts: t.counts,
+      balance: t.balance, counts: t.counts, boat: t.boat,
       orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
       session: t.session, theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
@@ -176,6 +176,43 @@ async function waitForRound(index) {
     const s = await snap();
     return (s.phase === 'play' && s.round && s.round.index === index) ? s : null;
   }, `round ${index} starts`, 90_000);
+}
+// 速度を保ったままリリースするドラッグ（舟の押し出し・投擲用）
+async function dragFling(fromL, toL, { steps = 6 } = {}) {
+  const a = await toClient(fromL.x, fromL.y);
+  const b = await toClient(toL.x, toL.y);
+  await page.mouse.move(a.x, a.y);
+  await page.mouse.down();
+  await new Promise(r => setTimeout(r, 40));
+  for (let i = 1; i <= steps; i++) {
+    await page.mouse.move(a.x + (b.x - a.x) * i / steps, a.y + (b.y - a.y) * i / steps);
+    await new Promise(r => setTimeout(r, 12));
+  }
+  await page.mouse.up();
+}
+// 果物保存 invariant: 全果物が既知 state・総数がラウンドの果物数と一致
+const OFUNE_STATES = ['field', 'drag', 'boat', 'float', 'eaten'];
+function checkConservation(s) {
+  assert(s.apples.length === s.round.fruitsTotal,
+    `fruit conservation: count ${s.apples.length} vs total ${s.round.fruitsTotal}`);
+  for (const a of s.apples) {
+    assert(OFUNE_STATES.includes(a.state), `fruit ${a.id} in unknown state '${a.state}'`);
+  }
+}
+// 自由な果物（field 優先、なければ float）を1個返す
+async function findOfuneFruit() {
+  const s = await snap();
+  return s.apples.find(a => a.state === 'field') || s.apples.find(a => a.state === 'float') || null;
+}
+// 果物1個を舟の甲板へ（load 増加 or あふれ発生まで待つ）
+async function loadOne(fruit) {
+  const before = await snap();
+  const fresh = before.apples.find(a => a.id === fruit.id) || fruit;
+  await drag({ x: fresh.x, y: fresh.y }, { x: before.boat.x, y: before.boat.y - before.boat.h });
+  return waitFor(async () => {
+    const s = await snap();
+    return (s.boat.load > before.boat.load || s.round.overflowEvents > before.round.overflowEvents) ? s : null;
+  }, `fruit ${fruit.id} loaded (or overflowed)`, 15_000);
 }
 async function openParentMenu() {
   const c = await toClient(28, 28);
@@ -544,6 +581,9 @@ function serve() {
       localStorage.setItem('wakekko_logs', JSON.stringify([
         { sessionStart: '2026-07-11T00:00:00Z', completed: false, problems: [] },
       ]));
+      localStorage.setItem('ofune_logs', JSON.stringify([
+        { sessionStart: 'y', game: 'ofune', v: 1, rounds: [{ fruitsTotal: '7', capacity: 3, trips: null }] }, null,
+      ]));
     });
     await page.reload();
     await waitFor(snap, '__tenbin after legacy reload', 10_000);
@@ -563,13 +603,14 @@ function serve() {
     const clip = await page.evaluate(() => navigator.clipboard.readText().catch(() => null));
     if (clip) {
       const parsed = JSON.parse(clip);
-      assert(Array.isArray(parsed.tenbin) && Array.isArray(parsed.wakekko),
-        'copied JSON contains tenbin + legacy wakekko');
+      assert(Array.isArray(parsed.tenbin) && Array.isArray(parsed.wakekko) && Array.isArray(parsed.ofune),
+        'copied JSON contains tenbin + ofune + legacy wakekko');
     }
-    // 消去は両キー
+    // 消去は3キー
     await tapRegion(menu.menuRegions.clear);
-    await waitFor(async () => (await readLogs()).length === 0 && (await readLogs('wakekko_logs')).length === 0,
-      'both log keys cleared', 5_000);
+    await waitFor(async () => (await readLogs()).length === 0 &&
+      (await readLogs('wakekko_logs')).length === 0 && (await readLogs('ofune_logs')).length === 0,
+      'all three log keys cleared', 5_000);
     await tapRegion(menu.menuRegions.close);
     await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
   });
@@ -600,6 +641,177 @@ function serve() {
     const t2 = (await snap()).theme;
     assert(t1.fruit === t2.fruit && t1.animals === t2.animals,
       `theme deterministic, got ${JSON.stringify(t1)} vs ${JSON.stringify(t2)}`);
+  });
+
+  // ==== おふね（第2ゲーム） ====
+  await test('ofune spring: loading causes visible bob (non-critical damping)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=ofune`);
+    await waitFor(snap, '__tenbin exposed (ofune)', 10_000);
+    const s = await waitForRound(0);
+    assert(s.game === 'ofune' && s.boat && s.boat.state === 'dock', `ofune boots at dock, got ${JSON.stringify(s.boat)}`);
+    const f = await findOfuneFruit();
+    await loadOne(f);
+    // ページ内 rAF で喫水バネをサンプリング
+    const series = await page.evaluate(() => new Promise(resolve => {
+      const out = [];
+      const t0 = performance.now();
+      function sample() {
+        const b = window.__tenbin.boat;
+        if (b) out.push(b.draft);
+        if (performance.now() - t0 < 4000) requestAnimationFrame(sample);
+        else resolve(out);
+      }
+      requestAnimationFrame(sample);
+    }));
+    const target = series[series.length - 1];
+    let flips = 0, prev = 0;
+    for (const d of series.map(v => v - target)) {
+      const sg = Math.abs(d) < 0.2 ? 0 : Math.sign(d);
+      if (sg !== 0 && prev !== 0 && sg !== prev) flips++;
+      if (sg !== 0) prev = sg;
+    }
+    assert(flips >= 2, `boat bobs with >=2 overshoot flips, got ${flips} (n=${series.length})`);
+  });
+
+  await test('ofune boot: world exposed, tenbin-only getters null, conservation holds', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    const s = await waitForRound(0);
+    assert(s.game === 'ofune', `game ofune, got ${s.game}`);
+    assert(s.round.fruitsTotal >= 6 && s.round.fruitsTotal <= 10, `fruits 6..10, got ${s.round.fruitsTotal}`);
+    assert(s.boat.capacity >= 3 && s.boat.capacity <= 5, `capacity 3..5, got ${s.boat.capacity}`);
+    assert(s.boat.load === 0 && s.boat.state === 'dock', 'boat starts empty at dock');
+    assert(s.plates === null && s.balance === null && s.counts === null, 'tenbin getters null in ofune');
+    assert(s.mouths && s.mouths.L.r > 0 && s.mouths.R.r > 0, 'shore animal capsules exposed');
+    checkConservation(s);
+  });
+
+  await test('ofune overflow: capacity+1th fruit floats back — world performs the subtraction', async () => {
+    for (;;) {
+      const s = await snap();
+      if (s.boat.load >= s.boat.capacity) break;
+      const f = await findOfuneFruit();
+      assert(f, 'free fruit available while loading');
+      await loadOne(f);
+    }
+    const before = await snap();
+    assert(before.boat.load === before.boat.capacity, 'boat loaded to capacity');
+    const extra = await findOfuneFruit();
+    assert(extra, 'one more fruit available');
+    const after = await loadOne(extra);
+    assert(after.boat.load === after.boat.capacity, `load never exceeds capacity, got ${after.boat.load}/${after.boat.capacity}`);
+    assert(after.round.overflowEvents >= 1, `overflowEvents counted, got ${after.round.overflowEvents}`);
+    await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === extra.id);
+      return a.state === 'field' ? a : null;
+    }, 'overflowed fruit drifts back to shore', 30_000);
+    checkConservation(await snap());
+  });
+
+  await test('ofune sail: heavy push crosses, animals eat, exact-full counted, boat returns', async () => {
+    const before = await snap();
+    const wasExactFull = before.boat.load === before.boat.capacity;
+    await dragFling({ x: before.boat.x, y: before.boat.y + before.boat.h / 3 },
+      { x: before.boat.x + 320, y: before.boat.y + before.boat.h / 3 });
+    await waitFor(async () => (await snap()).round.trips >= 1, 'boat arrives, trip counted', 30_000);
+    if (wasExactFull) {
+      assert((await snap()).round.exactFullTrips >= 1, 'exact-full trip counted');
+    }
+    await waitFor(async () => {
+      const s = await snap();
+      return s.boat.state === 'dock' && s.boat.load === 0;
+    }, 'empty boat drifts back to dock', 30_000);
+    checkConservation(await snap());
+  });
+
+  await test('ofune water: thrown fruit splashes, floats back to shore, still usable', async () => {
+    const s0 = await snap();
+    const f = await findOfuneFruit();
+    assert(f, 'free fruit exists');
+    const splashesBefore = s0.round.splashes;
+    await drag({ x: f.x, y: f.y }, { x: 560, y: 620 });
+    await waitFor(async () => (await snap()).round.splashes > splashesBefore, 'splash counted', 10_000);
+    await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === f.id);
+      return a.state === 'field' ? a : null;
+    }, 'floating fruit drifts back to shore', 30_000);
+    checkConservation(await snap());
+  });
+
+  await test('ofune direct feed: carrying across by hand still feeds (no refusal)', async () => {
+    const s0 = await snap();
+    const f = await findOfuneFruit();
+    const dfBefore = s0.round.directFeeds;
+    await drag({ x: f.x, y: f.y }, { x: s0.mouths.L.x, y: s0.mouths.L.y });
+    await waitFor(async () => (await snap()).round.directFeeds > dfBefore, 'direct feed counted', 10_000);
+    checkConservation(await snap());
+  });
+
+  await test('ofune empty push: boat never strands mid-water', async () => {
+    const s = await snap();
+    assert(s.boat.load === 0, 'boat empty for this test');
+    await dragFling({ x: s.boat.x, y: s.boat.y + s.boat.h / 3 },
+      { x: s.boat.x + 260, y: s.boat.y + s.boat.h / 3 });
+    await waitFor(async () => (await snap()).boat.state === 'dock', 'boat comes back to dock', 30_000);
+  });
+
+  await test('ofune round completes (mixed means), log v1 schema, next round starts', async () => {
+    let flip = false;
+    for (;;) {
+      const s = await snap();
+      if (s.phase !== 'play') break;
+      const f = await findOfuneFruit();
+      if (!f) {
+        const onBoat = s.apples.find(a => a.state === 'boat');
+        if (!onBoat) break;
+        await dragFling({ x: s.boat.x, y: s.boat.y + s.boat.h / 3 }, { x: s.boat.x + 320, y: s.boat.y + s.boat.h / 3 });
+        await waitFor(async () => {
+          const x = await snap();
+          return x.phase !== 'play' || x.apples.every(a => a.state !== 'boat');
+        }, 'boat cargo delivered', 30_000);
+        continue;
+      }
+      flip = !flip;
+      const target = flip ? 'L' : 'R';
+      const m = (await snap()).mouths[target];
+      await drag({ x: f.x, y: f.y }, { x: m.x, y: m.y });
+      await new Promise(r => setTimeout(r, 150));
+    }
+    await waitFor(async () => {
+      const s = await snap();
+      return s.phase === 'celebrate' || s.phase === 'transition' || s.phase === 'interlude';
+    }, 'ofune round completes', 90_000);
+    await waitForRound(1);
+    const sess = (await readLogs('ofune_logs')).slice(-1)[0];
+    assert(sess && sess.game === 'ofune' && sess.v === 1, `ofune session record, got ${JSON.stringify({ game: sess?.game, v: sess?.v })}`);
+    const r0 = sess.rounds[0];
+    assert(r0 && r0.endedBy === 'cleared' &&
+      typeof r0.fruitsTotal === 'number' && typeof r0.capacity === 'number' &&
+      typeof r0.trips === 'number' && r0.trips >= 1 &&
+      typeof r0.exactFullTrips === 'number' && r0.overflowEvents >= 1 &&
+      typeof r0.directFeeds === 'number' && r0.directFeeds >= 1 &&
+      r0.splashes >= 1 && r0.durationMs > 0,
+      `round 0 schema+values, got ${JSON.stringify(r0)}`);
+  });
+
+  await test('ofune home mid-round: partial round + session endedBy recorded', async () => {
+    const f = await findOfuneFruit();
+    const s0 = await snap();
+    await drag({ x: f.x, y: f.y }, { x: s0.mouths.R.x, y: s0.mouths.R.y });
+    await waitFor(async () => (await snap()).round.directFeeds >= 1, 'one direct feed', 10_000);
+    const s = await snap();
+    await pressHold({ x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 },
+      Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 5_000);
+    const sess = (await readLogs('ofune_logs')).slice(-1)[0];
+    assert(sess.endedBy === 'home' && sess.rounds.slice(-1)[0].endedBy === 'home',
+      `partial ofune round + session endedBy home, got ${JSON.stringify(sess.rounds.slice(-1)[0])}`);
+    const m = await snap();
+    assert(m.menuTiles.tenbin && m.menuTiles.ofune, `both tiles on menu, got ${JSON.stringify(m.menuTiles)}`);
+    await tapRegion(m.menuTiles.ofune);
+    await waitForRound(0);
   });
 
   // --- v0.4監査 F2: 動物の足元に放しても食べる（拒食に見える空白を残さない） ---
