@@ -97,6 +97,23 @@ var MENU_RECTS = {
   close: { x: 472, y: 526, w: 80, h: 56 }
 };
 
+// v0.3: 画面遷移(タイトル/メニュー/ゲーム)。おうちボタンは右上、左上長押しゾーンと対で配置
+var HOME_ZONE = { x: LOGICAL_W - 90, y: 0, w: 90, h: 90 };
+var HOME_PRESS_MS = 800; // シミュレーション時間で0.8秒押し込み続けるとメニューへ戻る
+
+// v0.3: メニュー画面の絵タイル2枚(てんびん/わけっこ)。左右対称配置
+var MENU_TILE_TENBIN = { x: 120, y: 190, w: 340, h: 360 };
+var MENU_TILE_WAKEKKO = { x: 564, y: 190, w: 340, h: 360 };
+
+// v0.3: 第2ゲーム「わけっこ」。レベルは a/b(欲しい数)。左右割当はシード乱数で反転する
+var WAKEKKO_LEVELS = [
+  { a: 2, b: 1 }, { a: 2, b: 2 }, { a: 3, b: 2 }, { a: 3, b: 4 }, { a: 4, b: 3 }
+];
+var WAKEKKO_PLATE_L = { x: 300, y: 600 };
+var WAKEKKO_PLATE_R = { x: 724, y: 600 };
+var WAKEKKO_PILE_ZONE = { x: 400, y: 450, w: 220, h: 140 };
+var WAKEKKO_PULSE_MS = 1600; // 不一致で全部置いた時、足りない側の思考泡がゆっくり拡縮する周期
+
 // ==== SECTION: rng ====
 function mulberry32(seed) {
   var a = seed >>> 0;
@@ -349,6 +366,10 @@ var dpr = Math.min(window.devicePixelRatio || 1, 2);
 var layout = { scale: 1, offsetX: 0, offsetY: 0 };
 
 // mutable game state (module scope)
+// v0.3: 画面遷移。screen='title'|'menu'|'game'、currentGame='tenbin'|'wakekko'|null
+// (screen!=='game' の間は null)。揮発状態で保存しない(リロードでタイトルから)
+var screen = 'title';
+var currentGame = null;
 var phase = 'play'; // 'play' | 'celebrate' | 'transition' | 'sessionEnd'
 var problemIndex = 0;
 var simTimeMs = 0;
@@ -357,6 +378,7 @@ var nextAppleId = 1;
 var plateOrder = { L: [], R: [] };
 var plates = { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } };
 var balance = { angle: 0, vel: 0, target: 0 };
+var wants = { left: 0, right: 0 }; // v0.3: わけっこの「欲しい数」。てんびん中は未使用
 var counts = { left: 0, right: 0 };
 var orientationBlocked = false;
 var menuOpen = false;
@@ -364,13 +386,16 @@ var celebrationType = null;
 var settleTimer = 0;
 var dragApple = null;
 var longPress = null; // {active, x, y, elapsed}
+var homePress = null; // v0.3: {active, x, y, elapsed} おうちボタンの押し込みゲージ
 var activePointerId = null;
 var celebrate = null;
 var transitionState = null;
 var animalBounce = { L: 0, R: 0 };
 var particles = [];
 var problemLog = { startSimMs: 0, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
-var logStorage = loadLogs();
+// v0.3: ログはゲーム別(tenbin_logs/wakekko_logs)。session はゲーム外では null
+var LOG_KEYS = { tenbin: 'tenbin_logs', wakekko: 'wakekko_logs' };
+var logStorages = { tenbin: loadLogs(LOG_KEYS.tenbin), wakekko: loadLogs(LOG_KEYS.wakekko) };
 var session = null;
 // v0.2: 無操作ヒント(ゴーストハンド)の基準時刻。問題開始とどこかのタップでリセットする
 var lastInteractionSimMs = 0;
@@ -452,24 +477,58 @@ function generateLevelApples(idx) {
   return list;
 }
 
+// v0.3: 現在のゲームのレベルテーブル
+function currentLevels() { return currentGame === 'wakekko' ? WAKEKKO_LEVELS : LEVELS; }
+
 function startProblem(idx) {
   dragApple = null; // 遷移をまたいで旧問題のりんごを持ち越さない
-  apples = generateLevelApples(idx); // id はセッション通しで一意（リセットしない）
   plateOrder = { L: [], R: [] };
   balance.angle = 0; balance.vel = 0; balance.target = 0;
   settleTimer = 0;
   celebrationType = null;
   problemLog = { startSimMs: simTimeMs, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
   lastInteractionSimMs = simTimeMs; // 無操作ヒントの基準時刻もこの問題の開始瞬間に確定
+  if (currentGame === 'wakekko') startWakekkoProblem(idx); else startTenbinProblem(idx);
+}
+
+function startTenbinProblem(idx) {
+  apples = generateLevelApples(idx); // id はセッション通しで一意（リセットしない）
   // 導出状態（皿座標）もこの瞬間に確定させる。最初の物理ステップまでの間に
   // 入力・読み取りが来ても未初期化値 (0,0) を晒さない
   computePlates();
 }
 
+// ==== SECTION: wakekko ====
+// v0.3: 第2ゲーム「わけっこ」。皿は固定位置(天秤なし)。総数=wantL+wantRの果物の山を
+// 中央下に散らし、左右の「欲しい数」はシード乱数で反転する
+function startWakekkoProblem(idx) {
+  var def = WAKEKKO_LEVELS[idx];
+  var flip = rng() < 0.5;
+  wants.left = flip ? def.b : def.a;
+  wants.right = flip ? def.a : def.b;
+  // 皿(かご)は固定位置。この瞬間に確定させる(computePlates 相当)
+  plates.L.x = WAKEKKO_PLATE_L.x; plates.L.y = WAKEKKO_PLATE_L.y;
+  plates.R.x = WAKEKKO_PLATE_R.x; plates.R.y = WAKEKKO_PLATE_R.y;
+  var total = wants.left + wants.right;
+  var pts = layoutZone(total, WAKEKKO_PILE_ZONE, 0.7);
+  apples = [];
+  for (var i = 0; i < pts.length; i++) apples.push(makeApple(pts[i].x, pts[i].y));
+}
+
+// 不一致で全部置いた場合に「足りない側」を返す(静かに待つ演出の対象)。一致・未完了なら null
+function wakekkoMismatchSide() {
+  if (!allPlaced()) return null;
+  if (counts.left === wants.left && counts.right === wants.right) return null;
+  if (counts.left < wants.left) return 'left';
+  if (counts.right < wants.right) return 'right';
+  return null;
+}
+
 // ==== SECTION: logging ====
-function loadLogs() {
+// v0.3: ゲーム別キー(tenbin_logs/wakekko_logs)。関数はキー引数で共通化する
+function loadLogs(key) {
   try {
-    var raw = localStorage.getItem('tenbin_logs');
+    var raw = localStorage.getItem(key);
     if (!raw) return [];
     var parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -477,8 +536,8 @@ function loadLogs() {
     return parsed.filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); });
   } catch (e) { return []; }
 }
-function persistLogs() {
-  try { localStorage.setItem('tenbin_logs', JSON.stringify(logStorage)); } catch (e) {}
+function persistLogsFor(game) {
+  try { localStorage.setItem(LOG_KEYS[game], JSON.stringify(logStorages[game])); } catch (e) {}
 }
 function chooseTheme() {
   // ゲームRNGから選択(同?seedなら決定的。「もう1回」で変わりうる)
@@ -490,8 +549,8 @@ function chooseTheme() {
 function startNewSession() {
   chooseTheme();
   session = { sessionStart: new Date().toISOString(), completed: false, retried: false, problems: [] };
-  logStorage.push(session);
-  persistLogs();
+  logStorages[currentGame].push(session);
+  persistLogsFor(currentGame);
 }
 function finalizeProblem() {
   var rec = {
@@ -503,14 +562,16 @@ function finalizeProblem() {
     removedFromPlate: problemLog.removedFromPlate
   };
   session.problems.push(rec);
-  if (problemIndex >= LEVELS.length - 1) session.completed = true;
-  persistLogs();
-  celebrationType = counts.left > counts.right ? 'left' : (counts.right > counts.left ? 'right' : 'balance');
+  if (problemIndex >= currentLevels().length - 1) session.completed = true;
+  persistLogsFor(currentGame);
+  celebrationType = currentGame === 'wakekko'
+    ? 'both'
+    : (counts.left > counts.right ? 'left' : (counts.right > counts.left ? 'right' : 'balance'));
   phase = 'celebrate';
   celebrateInit();
 }
 function requestRestart() {
-  if (session) { session.retried = true; persistLogs(); }
+  if (session) { session.retried = true; persistLogsFor(currentGame); }
   startNewSession();
   problemIndex = 0;
   startProblem(0);
@@ -608,7 +669,14 @@ function allPlaced() {
 
 function updateSettle(dt) {
   if (!allPlaced()) { settleTimer = 0; return; }
-  if (Math.abs(balance.vel) < EPS_VEL && Math.abs(balance.angle - balance.target) < EPS_ANGLE) {
+  var settled;
+  if (currentGame === 'wakekko') {
+    // わけっこ: 個数が欲しい数と一致していることが「静止」の条件(不一致なら待ち続ける)
+    settled = (counts.left === wants.left && counts.right === wants.right);
+  } else {
+    settled = Math.abs(balance.vel) < EPS_VEL && Math.abs(balance.angle - balance.target) < EPS_ANGLE;
+  }
+  if (settled) {
     settleTimer += dt * 1000;
     if (settleTimer >= SETTLE_MS) finalizeProblem();
   } else {
@@ -617,10 +685,13 @@ function updateSettle(dt) {
 }
 
 function celebrateInit() {
+  // わけっこの celebrationType は常に'both'(一致したときしか完了しない)なので両方食べる
+  var eatL = currentGame === 'wakekko' ? true : (celebrationType === 'balance' || celebrationType === 'left');
+  var eatR = currentGame === 'wakekko' ? true : (celebrationType === 'balance' || celebrationType === 'right');
   celebrate = {
     biteTimer: 0, biteInterval: 380, stage: 'biting',
-    queueL: (celebrationType === 'balance' || celebrationType === 'left') ? plateOrder.L.slice() : [],
-    queueR: (celebrationType === 'balance' || celebrationType === 'right') ? plateOrder.R.slice() : [],
+    queueL: eatL ? plateOrder.L.slice() : [],
+    queueR: eatR ? plateOrder.R.slice() : [],
     finaleTimer: 0, finaleDone: false
   };
   applyBgmGain(); // 完了演出中は物理音(答え)をマスクしないようBGMをダッキング
@@ -671,7 +742,7 @@ function advanceAfterCelebration() {
   celebrate = null;
   celebrationType = null;
   applyBgmGain(); // 演出終了でBGM音量を復帰
-  if (problemIndex >= LEVELS.length - 1) {
+  if (problemIndex >= currentLevels().length - 1) {
     phase = 'sessionEnd';
   } else {
     phase = 'transition';
@@ -702,6 +773,18 @@ function updateLongPress(dt) {
   }
 }
 
+// v0.3: おうちボタンの0.8秒押し込み。発火時に前提(screen==='game')は
+// inHomeZone 判定時にしか homePress を作らないため、ここでは押し切ったら即 goHome
+function updateHomePress(dt) {
+  if (homePress && homePress.active) {
+    homePress.elapsed += dt * 1000;
+    if (homePress.elapsed >= HOME_PRESS_MS) {
+      homePress = null;
+      goHome();
+    }
+  }
+}
+
 function updatePhysics(dt) {
   counts.left = 0; counts.right = 0;
   for (var i = 0; i < apples.length; i++) {
@@ -709,11 +792,14 @@ function updatePhysics(dt) {
       if (apples[i].plate === 'L') counts.left++; else counts.right++;
     }
   }
-  balance.target = Math.max(-30, Math.min(30, (counts.right - counts.left) * 6));
-  var accel = SPRING_K * (balance.target - balance.angle) - SPRING_C * balance.vel;
-  balance.vel += accel * dt;
-  balance.angle += balance.vel * dt;
-  computePlates();
+  if (currentGame === 'tenbin') {
+    balance.target = Math.max(-30, Math.min(30, (counts.right - counts.left) * 6));
+    var accel = SPRING_K * (balance.target - balance.angle) - SPRING_C * balance.vel;
+    balance.vel += accel * dt;
+    balance.angle += balance.vel * dt;
+    computePlates();
+  }
+  // わけっこの皿(かご)は固定位置なので毎ステップの再計算は不要(startWakekkoProblemで確定済み)
 
   for (i = 0; i < apples.length; i++) {
     var a = apples[i];
@@ -737,7 +823,7 @@ function updatePhysics(dt) {
   if (animalBounce.R > 0) animalBounce.R = Math.max(0, animalBounce.R - dt * 1000);
 
   updateParticles(dt);
-  updateCreak(balance.vel);
+  updateCreak(currentGame === 'tenbin' ? balance.vel : 0);
 }
 
 // ==== SECTION: particles ====
@@ -809,6 +895,12 @@ function findDraggableApple(x, y) {
 function inCornerZone(x, y) {
   return x >= CORNER_ZONE.x && x <= CORNER_ZONE.x + CORNER_ZONE.w &&
          y >= CORNER_ZONE.y && y <= CORNER_ZONE.y + CORNER_ZONE.h;
+}
+
+// v0.3: おうちボタンの押し込み判定領域(右上。左上の隅長押しゾーンと対)
+function inHomeZone(x, y) {
+  return x >= HOME_ZONE.x && x <= HOME_ZONE.x + HOME_ZONE.w &&
+         y >= HOME_ZONE.y && y <= HOME_ZONE.y + HOME_ZONE.h;
 }
 
 function startDragApple(a, x, y) {
@@ -890,6 +982,38 @@ function menuPointerDown(x, y) {
   if (!inPanel) menuOpen = false;
 }
 
+// v0.3: メニュー画面(絵タイル2枚)のタップ処理。タイル外のタップは何もしない
+function menuScreenPointerDown(x, y) {
+  function hit(r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  if (hit(MENU_TILE_TENBIN)) { enterGame('tenbin'); return; }
+  if (hit(MENU_TILE_WAKEKKO)) { enterGame('wakekko'); return; }
+}
+
+// v0.3: ゲーム入場(セッション開始はこの瞬間に確定。title/menu中はセッションなし)
+function enterGame(game) {
+  currentGame = game;
+  screen = 'game';
+  problemIndex = 0;
+  startNewSession();
+  startProblem(0);
+  phase = 'play';
+}
+
+// v0.3: おうちボタンでの離脱。進行中のドラッグ・演出・タイマーを確実にリセットし、
+// 前のゲームの状態が次回入場時に漏れないようにする。セッションは中断のまま
+// (completed:false)ストレージに残る——従来のリロード中断と同じ扱い
+function goHome() {
+  screen = 'menu';
+  currentGame = null;
+  session = null;
+  dragApple = null;
+  longPress = null;
+  homePress = null;
+  celebrate = null;
+  transitionState = null;
+  settleTimer = 0;
+}
+
 function handlePointerDown(x, y) {
   ensureAudio();
   lastInteractionSimMs = simTimeMs; // v0.2: どこをタップしても無操作ヒントのタイマーは即リセット
@@ -898,6 +1022,10 @@ function handlePointerDown(x, y) {
   // 隅の長押しはりんごより優先（判定円の重なりで作用先が曖昧にならないように）。
   // sessionEnd 画面でも親メニューへ到達できる
   if (inCornerZone(x, y)) { longPress = { active: true, x: x, y: y, elapsed: 0 }; return; }
+  if (screen === 'game' && inHomeZone(x, y)) { homePress = { active: true, x: x, y: y, elapsed: 0 }; return; }
+  if (screen === 'title') { screen = 'menu'; return; }
+  if (screen === 'menu') { menuScreenPointerDown(x, y); return; }
+  // screen === 'game'（てんびん/わけっこ共通。物理の実体は apples/plates を共有する）
   if (phase === 'sessionEnd') { requestRestart(); return; }
   // 演出・遷移中はドラッグ開始不可（食べキュー・問題差し替えと競合させない）
   if (phase !== 'play') return;
@@ -913,10 +1041,14 @@ function handlePointerMove(x, y) {
   if (longPress && longPress.active) {
     if (Math.hypot(x - longPress.x, y - longPress.y) > 24) longPress.active = false;
   }
+  if (homePress && homePress.active) {
+    if (Math.hypot(x - homePress.x, y - homePress.y) > 24) homePress.active = false;
+  }
 }
 function handlePointerUp(x, y) {
   if (dragApple) { releaseDragApple(x, y); }
   longPress = null;
+  homePress = null; // 指を離すとゲージはリセット
 }
 
 // v0.2: 無操作ヒント(ゴーストハンド)。純粋にsimTimeMsから導出する値で、
@@ -926,9 +1058,17 @@ function firstFieldApple() {
   return null;
 }
 function isHintActive() {
-  return phase === 'play' && !menuOpen && !orientationBlocked &&
+  return screen === 'game' && phase === 'play' && !menuOpen && !orientationBlocked &&
     problemLog.firstTouchSimMs === null &&
     (simTimeMs - lastInteractionSimMs) >= HINT_DELAY_MS;
+}
+// v0.3: ヒントの誘導先の皿。てんびんは近い方、わけっこは「欲しい数が多い方」
+// (山→泡の多い側の皿、という動詞のデモ)
+function hintTargetPlate(apple) {
+  if (currentGame === 'wakekko') return wants.left >= wants.right ? plates.L : plates.R;
+  var dL = Math.hypot(apple.x - plates.L.x, apple.y - plates.L.y);
+  var dR = Math.hypot(apple.x - plates.R.x, apple.y - plates.R.y);
+  return dL <= dR ? plates.L : plates.R;
 }
 
 function bindInput() {
@@ -989,7 +1129,7 @@ function bindInput() {
 var menuFlash = { copy: 0, clear: 0 };
 
 function copyLogsToClipboard() {
-  var text = JSON.stringify(logStorage);
+  var text = JSON.stringify({ tenbin: logStorages.tenbin, wakekko: logStorages.wakekko });
   function ok() { menuFlash.copy = 900; }
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1016,17 +1156,21 @@ function fallbackCopy(text, ok) {
 }
 function clearLogs() {
   // 消去は消去だけ行う。進行中の session はストレージから切り離されたまま続行し、
-  // 以後の persistLogs() で復活しない（次の startNewSession から記録再開）
-  logStorage = [];
-  persistLogs();
+  // 以後の persistLogsFor() で復活しない（次の startNewSession から記録再開）。両ゲームとも消す
+  logStorages.tenbin = [];
+  logStorages.wakekko = [];
+  persistLogsFor('tenbin');
+  persistLogsFor('wakekko');
   menuFlash.clear = 900;
 }
 
-function computeStats() {
-  var sessions = logStorage.length;
+// v0.3: 統計はゲーム別(引数のキーで logStorages を読む)
+function computeStatsFor(game) {
+  var arr = logStorages[game];
+  var sessions = arr.length;
   var completed = 0, retried = 0;
-  for (var i = 0; i < logStorage.length; i++) {
-    var s = logStorage[i];
+  for (var i = 0; i < arr.length; i++) {
+    var s = arr[i];
     if (!s || typeof s !== 'object') continue;
     if (s.completed) completed++;
     if (s.retried) retried++;
@@ -1049,16 +1193,18 @@ function drawMenu(c) {
   c.lineWidth = 2;
   c.stroke();
 
-  var stats = computeStats();
+  var statsT = computeStatsFor('tenbin');
+  var statsW = computeStatsFor('wakekko');
   c.fillStyle = '#333';
   c.textAlign = 'left';
   c.textBaseline = 'alphabetic';
   c.font = '22px sans-serif';
   c.fillText('親メニュー', MENU_PANEL.x + 30, MENU_PANEL.y + 44);
   c.font = '16px sans-serif';
-  c.fillText('セッション数: ' + stats.sessions, MENU_PANEL.x + 30, MENU_PANEL.y + 90);
-  c.fillText('完走率: ' + Math.round(stats.completeRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 120);
-  c.fillText('もう1回率: ' + Math.round(stats.retryRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 150);
+  c.fillText('てんびん  回数' + statsT.sessions + '  完走' + Math.round(statsT.completeRate * 100) +
+    '%  もう1回' + Math.round(statsT.retryRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 90);
+  c.fillText('わけっこ  回数' + statsW.sessions + '  完走' + Math.round(statsW.completeRate * 100) +
+    '%  もう1回' + Math.round(statsW.retryRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 120);
 
   drawMenuButton(c, MENU_RECTS.bgm, 'おんがく: ' + (bgmEnabled ? 'オン' : 'オフ'));
   drawMenuButton(c, MENU_RECTS.copy, menuFlash.copy > 0 ? 'コピーしました' : 'ログをコピー');
@@ -1092,9 +1238,7 @@ function drawHintHand(c) {
   if (!isHintActive()) return;
   var apple = firstFieldApple();
   if (!apple) return;
-  var dL = Math.hypot(apple.x - plates.L.x, apple.y - plates.L.y);
-  var dR = Math.hypot(apple.x - plates.R.x, apple.y - plates.R.y);
-  var target = dL <= dR ? plates.L : plates.R;
+  var target = hintTargetPlate(apple);
   var elapsed = simTimeMs - lastInteractionSimMs - HINT_DELAY_MS;
   var cyclePos = elapsed % HINT_CYCLE_MS;
   if (cyclePos < 0) cyclePos += HINT_CYCLE_MS;
@@ -1157,7 +1301,7 @@ function drawBackground(c) {
 }
 
 function drawProgressDots(c) {
-  var n = LEVELS.length;
+  var n = currentLevels().length;
   var spacing = 30;
   var startX = LOGICAL_W / 2 - ((n - 1) * spacing) / 2;
   for (var i = 0; i < n; i++) {
@@ -1287,6 +1431,69 @@ function drawPlateDish(c, x, y) {
   c.strokeStyle = '#aab5c2';
   c.lineWidth = 3;
   c.stroke();
+}
+
+// v0.3: わけっこの皿は天秤の吊り皿ではなく、台の上の皿・かごの見た目(固定位置)
+function drawWakekkoBasketShape(c, x, y) {
+  c.save();
+  c.fillStyle = '#c9a876';
+  c.beginPath();
+  c.moveTo(x - PLATE_DISH_RX * 0.8, y + 4);
+  c.lineTo(x - PLATE_DISH_RX * 0.95, y + 24);
+  c.lineTo(x + PLATE_DISH_RX * 0.95, y + 24);
+  c.lineTo(x + PLATE_DISH_RX * 0.8, y + 4);
+  c.closePath();
+  c.fill();
+  c.strokeStyle = '#8a6a45';
+  c.lineWidth = 2;
+  c.stroke();
+  c.restore();
+  drawPlateDish(c, x, y);
+}
+
+function drawWakekkoBaskets(c) {
+  drawWakekkoBasketShape(c, plates.L.x, plates.L.y);
+  drawWakekkoBasketShape(c, plates.R.x, plates.R.y);
+  drawPlateApples(c, 'L');
+  drawPlateApples(c, 'R');
+}
+
+// v0.3: 頭上の思考泡(欲しい数だけの果物シルエット。皿に載った数だけ左から実色に埋まる)
+function drawThoughtBubble(c, x, y, want, count, side) {
+  if (want <= 0) return;
+  var scale = 1;
+  if (wakekkoMismatchSide() === side) {
+    // 不一致で全部置いた時、足りない側だけゆっくり拡縮する(明滅は1秒3回未満・✗やブザーは出さない)
+    scale = 1 + Math.sin((simTimeMs / WAKEKKO_PULSE_MS) * Math.PI * 2) * 0.08;
+  }
+  c.save();
+  c.translate(x, y);
+  c.scale(scale, scale);
+  var half = want * 20;
+  roundRect(c, -half - 14, -26, half * 2 + 28, 52, 22);
+  c.fillStyle = 'rgba(255,255,255,0.75)';
+  c.fill();
+  c.strokeStyle = 'rgba(150,150,150,0.4)';
+  c.lineWidth = 2;
+  c.stroke();
+  for (var i = 0; i < want; i++) {
+    var ix = -((want - 1) * 20) + i * 40;
+    if (i < count) {
+      drawFruitShape(c, ix, 0, 14, 1);
+    } else {
+      c.beginPath();
+      c.arc(ix, 0, 14, 0, Math.PI * 2);
+      c.strokeStyle = 'rgba(120,120,120,0.35)';
+      c.lineWidth = 2;
+      c.stroke();
+    }
+  }
+  c.restore();
+}
+
+function drawThoughtBubbles(c) {
+  drawThoughtBubble(c, BEAR_POS.x, BEAR_POS.y - 190, wants.left, counts.left, 'left');
+  drawThoughtBubble(c, RABBIT_POS.x, RABBIT_POS.y - 190, wants.right, counts.right, 'right');
 }
 
 function drawBear(c, x, y, bounce) {
@@ -1517,6 +1724,130 @@ function drawRotatePrompt(c) {
   c.restore();
 }
 
+// v0.3: タイトルの天秤(装飾。ゲーム物理とは独立にsimTimeMsから揺れを導出)。
+// scale を渡すことでメニュー画面の絵タイルにも同じ絵を縮小して使い回す
+function drawTitleTenbin(c, cx, cy, scale) {
+  scale = scale || 1;
+  var wob = Math.sin(simTimeMs / 900) * 10;
+  var rad = wob * Math.PI / 180;
+  var armLen = 170 * scale, rodLen = 70 * scale;
+  var cos = Math.cos(rad), sin = Math.sin(rad);
+  var lex = cx - armLen * cos, ley = cy - armLen * sin;
+  var rex = cx + armLen * cos, rey = cy + armLen * sin;
+  c.save();
+  c.fillStyle = '#8a6a45';
+  c.beginPath();
+  c.moveTo(cx - 12 * scale, cy + 150 * scale);
+  c.lineTo(cx + 12 * scale, cy + 150 * scale);
+  c.lineTo(cx + 5 * scale, cy);
+  c.lineTo(cx - 5 * scale, cy);
+  c.closePath();
+  c.fill();
+  c.strokeStyle = '#7a5a38';
+  c.lineWidth = 9 * scale;
+  c.lineCap = 'round';
+  c.beginPath(); c.moveTo(lex, ley); c.lineTo(rex, rey); c.stroke();
+  c.beginPath(); c.arc(cx, cy, 9 * scale, 0, Math.PI * 2); c.fillStyle = '#5f462b'; c.fill();
+  c.strokeStyle = '#9a9a9a';
+  c.lineWidth = 3 * scale;
+  c.beginPath(); c.moveTo(lex, ley); c.lineTo(lex, ley + rodLen); c.stroke();
+  c.beginPath(); c.moveTo(rex, rey); c.lineTo(rex, rey + rodLen); c.stroke();
+  c.beginPath();
+  c.ellipse(lex, ley + rodLen, PLATE_DISH_RX * scale, PLATE_DISH_RY * scale, 0, 0, Math.PI * 2);
+  c.fillStyle = '#dfe7ee'; c.fill(); c.strokeStyle = '#aab5c2'; c.lineWidth = 3 * scale; c.stroke();
+  c.beginPath();
+  c.ellipse(rex, rey + rodLen, PLATE_DISH_RX * scale, PLATE_DISH_RY * scale, 0, 0, Math.PI * 2);
+  c.fillStyle = '#dfe7ee'; c.fill(); c.strokeStyle = '#aab5c2'; c.lineWidth = 3 * scale; c.stroke();
+  c.restore();
+}
+
+// v0.3: タイトル画面。文字なし。ゆれる天秤＋テーマの動物2匹＋やわらかい背景。どこでもタップ→menu
+function drawTitleScreen(c) {
+  drawBackground(c);
+  drawTitleTenbin(c, LOGICAL_W / 2, 260, 1);
+  var pair = ANIMAL_DRAWERS['bear-rabbit'];
+  pair.left(c, BEAR_POS.x, BEAR_POS.y, 0);
+  pair.right(c, RABBIT_POS.x, RABBIT_POS.y, 0);
+}
+
+// v0.3: メニュー画面。絵タイル2枚(てんびん/わけっこ)。文字・数字なし
+function drawMiniWakekkoIcon(c, cx, cy) {
+  var pair = ANIMAL_DRAWERS['bear-rabbit'];
+  c.save(); c.translate(cx - 70, cy + 50); c.scale(0.42, 0.42); pair.left(c, 0, 0, 0); c.restore();
+  c.save(); c.translate(cx + 70, cy + 50); c.scale(0.42, 0.42); pair.right(c, 0, 0, 0); c.restore();
+  drawFruitShape(c, cx - 26, cy - 40, 16, 1);
+  drawFruitShape(c, cx + 26, cy - 40, 16, 1);
+}
+
+function drawMenuTile(c, r, kind) {
+  roundRect(c, r.x, r.y, r.w, r.h, 24);
+  c.fillStyle = '#fff8ea';
+  c.fill();
+  c.strokeStyle = '#d8d2c0';
+  c.lineWidth = 3;
+  c.stroke();
+  c.save();
+  roundRect(c, r.x, r.y, r.w, r.h, 24);
+  c.clip();
+  var cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  if (kind === 'tenbin') drawTitleTenbin(c, cx, cy - 30, 0.42);
+  else drawMiniWakekkoIcon(c, cx, cy - 10);
+  c.restore();
+}
+
+function drawMenuScreen(c) {
+  drawBackground(c);
+  drawMenuTile(c, MENU_TILE_TENBIN, 'tenbin');
+  drawMenuTile(c, MENU_TILE_WAKEKKO, 'wakekko');
+}
+
+// v0.3: おうちボタン(右上)。0.8秒の押し込みゲージを円弧で表す。文字なし
+function drawHomeButton(c) {
+  var cx = HOME_ZONE.x + HOME_ZONE.w / 2, cy = HOME_ZONE.y + HOME_ZONE.h / 2;
+  c.save();
+  c.translate(cx, cy);
+  c.fillStyle = 'rgba(255,255,255,0.85)';
+  c.beginPath(); c.arc(0, 0, 26, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#8a6a45';
+  c.beginPath(); c.moveTo(-14, 2); c.lineTo(0, -12); c.lineTo(14, 2); c.closePath(); c.fill();
+  c.fillStyle = '#c9a876';
+  c.fillRect(-10, 2, 20, 14);
+  c.restore();
+  var progress = homePress && homePress.active ? Math.min(1, homePress.elapsed / HOME_PRESS_MS) : 0;
+  if (progress > 0) {
+    c.save();
+    c.translate(cx, cy);
+    c.beginPath();
+    c.arc(0, 0, 32, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+    c.strokeStyle = '#ff9f5a';
+    c.lineWidth = 5;
+    c.lineCap = 'round';
+    c.stroke();
+    c.restore();
+  }
+}
+
+// v0.3: ゲーム画面(てんびん/わけっこ共通の器。差分は皿・動物頭上の演出のみ)
+function drawGameScreen(c) {
+  drawBackground(c);
+  drawProgressDots(c);
+  drawFieldApples(c);
+  if (currentGame === 'wakekko') {
+    drawWakekkoBaskets(c);
+    drawAnimals(c);
+    drawThoughtBubbles(c);
+  } else {
+    drawBeamAndPlates(c);
+    drawAnimals(c);
+  }
+  drawDragApple(c);
+  drawHintHand(c);
+  drawParticles(c);
+  drawHomeButton(c);
+  if (phase === 'sessionEnd') drawSessionEnd(c);
+  if (phase === 'transition' && transitionState) drawTransitionFade(c);
+}
+
 function render() {
   updateLayout();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1528,19 +1859,15 @@ function render() {
   ctx.rect(0, 0, LOGICAL_W, LOGICAL_H);
   ctx.clip();
 
-  drawBackground(ctx);
   if (orientationBlocked) {
+    drawBackground(ctx);
     drawRotatePrompt(ctx);
+  } else if (screen === 'title') {
+    drawTitleScreen(ctx);
+  } else if (screen === 'menu') {
+    drawMenuScreen(ctx);
   } else {
-    drawProgressDots(ctx);
-    drawFieldApples(ctx);
-    drawBeamAndPlates(ctx);
-    drawAnimals(ctx);
-    drawDragApple(ctx);
-    drawHintHand(ctx);
-    drawParticles(ctx);
-    if (phase === 'sessionEnd') drawSessionEnd(ctx);
-    if (phase === 'transition' && transitionState) drawTransitionFade(ctx);
+    drawGameScreen(ctx);
   }
   if (menuOpen) drawMenu(ctx);
   ctx.restore();
@@ -1557,8 +1884,9 @@ function step(dt) {
   updateOrientation();
   if (orientationBlocked) { updateCreak(0); return; }
   updateLongPress(dt);
+  updateHomePress(dt);
   if (menuOpen) return;
-  updatePhysics(dt);
+  if (screen === 'game') updatePhysics(dt);
 }
 
 var lastRealTime = null;
@@ -1597,9 +1925,27 @@ function toClientPoint(x, y) {
 function installTenbinHook() {
   var api = {};
   Object.defineProperties(api, {
+    // --- 画面遷移(v0.3) ---
+    screen: { enumerable: true, get: function () { return screen; } },
+    game: { enumerable: true, get: function () { return screen === 'game' ? currentGame : null; } },
+    menuTiles: {
+      enumerable: true, get: function () {
+        if (screen !== 'menu') return null;
+        return {
+          tenbin: { x: MENU_TILE_TENBIN.x, y: MENU_TILE_TENBIN.y, w: MENU_TILE_TENBIN.w, h: MENU_TILE_TENBIN.h },
+          wakekko: { x: MENU_TILE_WAKEKKO.x, y: MENU_TILE_WAKEKKO.y, w: MENU_TILE_WAKEKKO.w, h: MENU_TILE_WAKEKKO.h }
+        };
+      }
+    },
+    homeButton: {
+      enumerable: true, get: function () {
+        if (screen !== 'game') return null;
+        return { x: HOME_ZONE.x, y: HOME_ZONE.y, w: HOME_ZONE.w, h: HOME_ZONE.h };
+      }
+    },
     phase: { enumerable: true, get: function () { return phase; } },
     problemIndex: { enumerable: true, get: function () { return problemIndex; } },
-    levels: { enumerable: true, get: function () { return LEVELS; } },
+    levels: { enumerable: true, get: function () { return currentGame === 'wakekko' ? WAKEKKO_LEVELS : LEVELS; } },
     apples: {
       enumerable: true, get: function () {
         return apples.map(function (a) {
@@ -1614,7 +1960,14 @@ function installTenbinHook() {
     },
     balance: {
       enumerable: true, get: function () {
+        if (screen !== 'game' || currentGame !== 'tenbin') return null;
         return { angle: balance.angle, vel: balance.vel, target: balance.target };
+      }
+    },
+    wants: {
+      enumerable: true, get: function () {
+        if (screen !== 'game' || currentGame !== 'wakekko') return null;
+        return { left: wants.left, right: wants.right };
       }
     },
     counts: { enumerable: true, get: function () { return { left: counts.left, right: counts.right }; } },
@@ -1635,7 +1988,7 @@ function installTenbinHook() {
     bgmEnabled: { enumerable: true, get: function () { return bgmEnabled; } },
     hintActive: { enumerable: true, get: function () { return isHintActive(); } },
     celebrationType: { enumerable: true, get: function () { return celebrationType; } },
-    session: { enumerable: true, get: function () { return session; } },
+    session: { enumerable: true, get: function () { return screen === 'game' ? session : null; } },
     problemLog: {
       enumerable: true, get: function () {
         return {
@@ -1659,9 +2012,14 @@ function init() {
   bindInput();
   window.addEventListener('resize', function () { updateLayout(); });
   updateLayout();
-  startNewSession();
-  startProblem(0);
-  phase = 'play';
+  // v0.3: ?game=tenbin|wakekko でタイトル/メニューを飛ばして直接そのゲームへ入場する
+  var gameParam = qs.get('game');
+  if (gameParam === 'tenbin' || gameParam === 'wakekko') {
+    enterGame(gameParam);
+  } else {
+    screen = 'title';
+    currentGame = null;
+  }
   installTenbinHook();
   requestAnimationFrame(frame);
 }
