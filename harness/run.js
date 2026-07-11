@@ -260,13 +260,18 @@ function serve() {
     assert(apple, 'field fruit exists');
     await drag({ x: apple.x, y: apple.y }, s.plates.R);
     await waitFor(async () => (await snap()).counts.right === 1, 'fruit lands on plate R before sampling', 5_000, 15);
-    const series = [];
-    const t0 = Date.now();
-    while (Date.now() - t0 < 4000) {
-      const b = (await snap()).balance;
-      series.push(b.angle - b.target);
-      await new Promise(r => setTimeout(r, 25));
-    }
+    // ページ内 rAF で毎フレームサンプリング（読み取りのみ。ハーネス側レイテンシに影響されない）
+    const series = await page.evaluate(() => new Promise(resolve => {
+      const out = [];
+      const t0 = performance.now();
+      function sample() {
+        const b = window.__tenbin.balance;
+        if (b) out.push(b.angle - b.target);
+        if (performance.now() - t0 < 4000) requestAnimationFrame(sample);
+        else resolve(out);
+      }
+      requestAnimationFrame(sample);
+    }));
     let flips = 0, prev = 0;
     for (const d of series) {
       const sg = Math.abs(d) < 0.05 ? 0 : Math.sign(d);
@@ -595,6 +600,62 @@ function serve() {
     const t2 = (await snap()).theme;
     assert(t1.fruit === t2.fruit && t1.animals === t2.animals,
       `theme deterministic, got ${JSON.stringify(t1)} vs ${JSON.stringify(t2)}`);
+  });
+
+  // --- v0.4監査 F2: 動物の足元に放しても食べる（拒食に見える空白を残さない） ---
+  await test('feed at animal feet: release low on the body still feeds', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const s = await snap();
+    const f = await findFreeFruit();
+    const fedBefore = s.round.fedL;
+    // 口ゾーン円の中心ではなく、動物の体の下端（足元）で放す
+    await drag({ x: f.x, y: f.y }, { x: s.mouths.L.x, y: 690 });
+    await waitFor(async () => {
+      const st = await snap();
+      return st.round && st.round.fedL > fedBefore;
+    }, 'fruit released at feet is eaten (no refusal gap)', 10_000);
+  });
+
+  // --- v0.4監査 F1: ロールイン中（未着手）の home 離脱で空レコードを残さない ---
+  await test('home during transition: untouched round is not logged', async () => {
+    await completeRound(() => 'R');
+    // celebrate → transition に入った瞬間に home 押し込み
+    await waitFor(async () => (await snap()).phase === 'transition', 'transition begins', 30_000, 20);
+    const s = await snap();
+    const hb = { x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 };
+    await pressHold(hb, Math.ceil(800 / TIMESCALE) + 300);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 5_000);
+    const sess = (await readLogs()).slice(-1)[0];
+    const untouched = sess.rounds.filter(r =>
+      r.endedBy === 'home' && (r.fedL + r.fedR + r.dropOutside + r.removedFromPlate === 0) && !r.clearedBalanced);
+    assert(untouched.length === 0,
+      `no all-zero untouched round records, got ${JSON.stringify(sess.rounds)}`);
+  });
+
+  // --- v0.4監査 F3: 破損した v2 数値フィールドは読み込み時に正規化される ---
+  await test('corrupt v2 numeric fields are normalized on load', async () => {
+    await page.evaluate(() => {
+      localStorage.setItem('tenbin_logs', JSON.stringify([
+        { sessionStart: 'x', game: 'tenbin', v: 2, rounds: [{ fruitsTotal: 4, fedL: '3', fedR: null, balanceCelebrations: '1', clearedBalanced: 1, durationMs: '9', endedBy: 'cleared' }] },
+      ]));
+    });
+    await page.reload();
+    await waitFor(snap, '__tenbin after reload', 10_000);
+    await waitForRound(0); // 入場時の persist でストレージが正規化された形に書き戻される
+    const logs = await readLogs();
+    const legacy = logs.find(x => x.sessionStart === 'x');
+    assert(legacy, 'legacy session preserved');
+    const r = legacy.rounds[0];
+    assert(typeof r.fedL === 'number' && r.fedL === 3 && typeof r.fedR === 'number' && r.fedR === 0 &&
+      typeof r.balanceCelebrations === 'number' && typeof r.durationMs === 'number' &&
+      typeof r.clearedBalanced === 'boolean',
+      `numeric fields normalized, got ${JSON.stringify(r)}`);
+    // 親メニューも問題なく開ける
+    const menu = await openParentMenu();
+    await tapRegion(menu.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
   });
 
   await test('no text during gameplay (guard) & no page errors', async () => {

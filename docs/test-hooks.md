@@ -31,7 +31,8 @@ window.__tenbin = {
   apples,           // [{id, x, y, r, state, plate}] 論理座標。
                     //   state: 'field'|'drag'|'plate'|'ground'|'eaten'
   plates,           // {L:{x,y}, R:{x,y}, catchHalfW} 皿中心の現在論理座標（傾き反映後）＋捕捉半幅
-  mouths,           // {L:{x,y,r}, R:{x,y,r}} 動物の口ゾーン（食べさせの捕捉円）
+  mouths,           // {L:{x,y,r,footY}, R:{...}} 動物の食べさせ捕捉域。
+                    //   (x,y)〜(x,footY) を軸とする半径 r の縦カプセル（体のどこに渡しても食べる）
   balance,          // {angle, vel, target}（度。angle>0 = 右が下）。ゲーム外は null
   counts,           // {left, right} 皿に載っている個数
   orientationBlocked, // 縦持ちブロック中か
