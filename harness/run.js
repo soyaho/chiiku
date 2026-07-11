@@ -674,6 +674,30 @@ function serve() {
     });
   });
 
+  // --- v0.3監査 所見1: 演出の最中におうちで離脱しても演出状態が画面外へ漏れ残らない ---
+  await test('goHome during celebration: no stale phase/celebration leaks to menu', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForProblem(0);
+    await completeProblem(() => 'R');
+    const c = await waitFor(async () => {
+      const st = await snap();
+      return st.phase === 'celebrate' ? st : null;
+    }, 'celebration in progress', 15_000);
+    const hb = { x: c.homeButton.x + c.homeButton.w / 2, y: c.homeButton.y + c.homeButton.h / 2 };
+    await pressHold(hb, Math.ceil(800 / TIMESCALE) + 400);
+    const m = await waitFor(async () => {
+      const st = await snap();
+      return st.screen === 'menu' ? st : null;
+    }, 'back to menu from celebration', 5_000);
+    // 演出状態（BGMダッキングの導出元・celebrationType）がメニューに漏れ残らない
+    assert(m.phase === 'play' && m.celebrationType === null,
+      `no stale celebration state on menu, got phase=${m.phase} celebration=${m.celebrationType}`);
+    // 再入場は正常
+    await tapRegion(m.menuTiles.tenbin);
+    await waitForProblem(0);
+  });
+
   await test('no page errors during entire run', async () => {
     assert(pageErrors.length === 0, `errors: ${pageErrors.slice(0, 5).join(' | ')}`);
   });
