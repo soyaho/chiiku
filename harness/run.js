@@ -5,7 +5,9 @@
  *
  * 実インターフェース主義: 操作は canvas への実マウスイベント（タッチのフォールバック経路）
  * のみで行い、内部状態 window.__tenbin は「読み取り」だけに使う（docs/test-hooks.md 参照）。
- * テスト入力の注入は ?seed / ?timescale の2つのみ。
+ * テスト入力の注入は ?seed / ?timescale / ?game の3つのみ。
+ * タイトル→メニュー→ゲームの実経路はナビゲーションシナリオが実タップで通し、
+ * 個別テストは ?game 直接入場で安定化する。
  *
  * 実行: node harness/run.js
  */
@@ -59,6 +61,8 @@ async function snap() {
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
       session: t.session, problemLog: t.problemLog,
       theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
+      screen: t.screen, game: t.game, menuTiles: t.menuTiles,
+      homeButton: t.homeButton, wants: t.wants,
     };
   });
 }
@@ -122,8 +126,20 @@ async function waitForProblem(index) {
     return (s.phase === 'play' && s.problemIndex === index) ? s : null;
   }, `problem ${index} starts`, 60_000);
 }
-function readLogs() {
-  return page.evaluate(() => JSON.parse(localStorage.getItem('tenbin_logs') || '[]'));
+function readLogs(key = 'tenbin_logs') {
+  return page.evaluate(k => JSON.parse(localStorage.getItem(k) || '[]'), key);
+}
+// 領域 {x,y,w,h} の中心をタップ
+async function tapRegion(r) {
+  return tap({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+}
+// 指定位置を実時間 holdMs 押し込み続ける
+async function pressHold(logical, holdMs) {
+  const c = await toClient(logical.x, logical.y);
+  await page.mouse.move(c.x, c.y);
+  await page.mouse.down();
+  await new Promise(r => setTimeout(r, holdMs));
+  await page.mouse.up();
 }
 
 // ---- 静的サーバ ----
@@ -184,7 +200,7 @@ function serve() {
 
   // --- 揺れの触感（非臨界減衰）: 低速で1個載せて角度の目標横断を観測 ---
   await test('spring: apple placement causes visible oscillation (non-critical damping)', async () => {
-    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2`);
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=tenbin`);
     const first = await waitFor(snap, '__tenbin exposed', 10_000);
     // 回帰ガード: 公開読み取り面は最初のフレーム前でも未初期化値を返さない
     assert(first.plates.L.x > 0 && first.plates.R.x > first.plates.L.x,
@@ -235,7 +251,7 @@ function serve() {
   // --- 本編セッション（高速） ---
   let bootTheme = null;
   await test('boot: play phase, level table, landscape ok, valid theme', async () => {
-    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
     await waitFor(snap, '__tenbin exposed', 10_000);
     const s = await waitForProblem(0);
     assert(s.levels.length === 5, `levels=5, got ${s.levels.length}`);
@@ -517,6 +533,120 @@ function serve() {
       `logs sanitized to objects, got ${JSON.stringify(clean)}`);
     await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
     await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  // ==== v0.3: 画面遷移（実経路: タイトル→メニュー→ゲーム→おうち→別ゲーム） ====
+  await test('navigation: title → menu → tenbin (real taps)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
+    const first = await waitFor(snap, '__tenbin exposed', 10_000);
+    assert(first.screen === 'title', `boots to title, got ${first.screen}`);
+    await tap({ x: 512, y: 400 }); // タイトルはどこでもタップで進む
+    const m = await waitFor(async () => {
+      const s = await snap();
+      return s.screen === 'menu' ? s : null;
+    }, 'menu screen after title tap', 5_000);
+    assert(m.menuTiles && m.menuTiles.tenbin && m.menuTiles.wakekko,
+      `menu tiles exposed, got ${JSON.stringify(m.menuTiles)}`);
+    await tapRegion(m.menuTiles.tenbin);
+    const g = await waitFor(async () => {
+      const s = await snap();
+      return (s.screen === 'game' && s.game === 'tenbin' && s.phase === 'play') ? s : null;
+    }, 'tenbin starts from menu tile', 5_000);
+    assert(g.homeButton && g.homeButton.w > 0, 'home button exposed in game');
+    assert(g.session, 'session starts at game entry');
+  });
+
+  await test('home button: short tap stays, 0.8s hold returns to menu', async () => {
+    const s = await snap();
+    const hb = { x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 };
+    await tap(hb); // 短タップでは戻らない（誤タップ耐性）
+    await new Promise(r => setTimeout(r, 300));
+    assert((await snap()).screen === 'game', 'short tap does not leave game');
+    await pressHold(hb, Math.ceil(800 / TIMESCALE) + 400); // 0.8s（シミュ時間）押し込み
+    await waitFor(async () => (await snap()).screen === 'menu', 'hold returns to menu', 5_000);
+  });
+
+  // ==== v0.3: わけっこ ====
+  await test('wakekko: enter from menu tile, wants exposed, pile matches', async () => {
+    const m = await snap();
+    await tapRegion(m.menuTiles.wakekko);
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return (st.screen === 'game' && st.game === 'wakekko' && st.phase === 'play') ? st : null;
+    }, 'wakekko starts from menu tile', 5_000);
+    assert(s.wants && s.wants.left > 0 && s.wants.right > 0, `wants exposed, got ${JSON.stringify(s.wants)}`);
+    assert(s.balance === null, 'balance is null in wakekko');
+    assert(s.apples.length === s.wants.left + s.wants.right,
+      `pile = wants sum, got ${s.apples.length} vs ${s.wants.left + s.wants.right}`);
+  });
+
+  await test('wakekko: correct split → both celebrate → next problem', async () => {
+    await completeProblem((a, s) => (s.counts.left < s.wants.left ? 'L' : 'R'));
+    const st = await waitFor(async () => {
+      const x = await snap();
+      return x.celebrationType ? x : null;
+    }, 'celebration starts', 10_000);
+    assert(st.celebrationType === 'both', `celebrationType both, got ${st.celebrationType}`);
+    await waitForProblem(1);
+  });
+
+  await test('wakekko: wrong split waits quietly (no ✗), fix → celebrate', async () => {
+    // 全部を欲しい数と違う配分で置く（多い側に寄せる）
+    const s0 = await snap();
+    const overSide = s0.wants.left >= s0.wants.right ? 'L' : 'R';
+    await (async () => {
+      for (;;) {
+        const s = await snap();
+        if (s.phase !== 'play') break;
+        const free = s.apples.find(a => a.state === 'field' || a.state === 'ground');
+        if (!free) break;
+        await placeOneApple(free, overSide); // 全部同じ側 → 必ず不一致
+      }
+    })();
+    // 世界は静かに待つ: 完了(celebrate)は発火しない
+    await new Promise(r => setTimeout(r, 1500)); // ≈12s シミュ時間
+    const sWait = await snap();
+    assert(sWait.phase === 'play' && !sWait.celebrationType,
+      `stays in play quietly, got phase=${sWait.phase} celebration=${sWait.celebrationType}`);
+    // 可逆: 置きすぎた側から正しい配分へ移し替える
+    for (;;) {
+      const s = await snap();
+      if (s.phase !== 'play') break;
+      const overKey = s.counts.left > s.wants.left ? 'L' : (s.counts.right > s.wants.right ? 'R' : null);
+      if (!overKey) break;
+      const underKey = overKey === 'L' ? 'R' : 'L';
+      const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === overKey);
+      await drag({ x: onPlate.x, y: onPlate.y }, s.plates[underKey]);
+      await waitFor(async () => {
+        const st = await snap();
+        const a = st.apples.find(x => x.id === onPlate.id);
+        return a.plate === underKey || st.phase !== 'play';
+      }, 'apple moved to the other plate', 15_000);
+    }
+    const st = await waitFor(async () => {
+      const x = await snap();
+      return (x.phase === 'celebrate' || x.phase === 'transition') ? x : null;
+    }, 'celebrate after fixing the split', 15_000);
+    assert(st.celebrationType === null || st.celebrationType === 'both', 'both-type celebration');
+    await waitForProblem(2);
+  });
+
+  await test('wakekko: session completes, wakekko_logs schema persisted', async () => {
+    for (let i = 2; i < 5; i++) {
+      await completeProblem((a, s) => (s.counts.left < s.wants.left ? 'L' : 'R'));
+      if (i < 4) await waitForProblem(i + 1);
+    }
+    await waitFor(async () => (await snap()).phase === 'sessionEnd', 'wakekko session end', 60_000);
+    const logs = await readLogs('wakekko_logs');
+    assert(logs.length >= 1, `wakekko session logged, got ${logs.length}`);
+    const sess = logs[logs.length - 1];
+    assert(sess.completed === true, 'completed=true');
+    assert(Array.isArray(sess.problems) && sess.problems.length === 5, `5 problems, got ${sess.problems?.length}`);
+    sess.problems.forEach((p, i) => {
+      assert(p.level === i && typeof p.durationMs === 'number' && p.durationMs > 0, `problem ${i} schema`);
+      assert(typeof p.firstTouchMs === 'number' && typeof p.dropOutside === 'number' &&
+        typeof p.removedFromPlate === 'number', `problem ${i} counters`);
+    });
   });
 
   await test('no page errors during entire run', async () => {
