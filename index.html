@@ -456,7 +456,10 @@ function relaxPoints(pts, zone) {
       }
     }
     for (var k = 0; k < pts.length; k++) {
-      pts[k].x = Math.min(zone.x + zone.w - APPLE_R, Math.max(zone.x + APPLE_R, pts[k].x));
+      // 右上はおうちボタンのタッチ余白ぶん狭める: 果物のタッチ円(APPLE_TOUCH_R)が
+      // HOME_ZONE と重ならないようにし、1タップの作用先を常に一意に保つ
+      var maxX = Math.min(zone.x + zone.w - APPLE_R, HOME_ZONE.x - APPLE_TOUCH_R);
+      pts[k].x = Math.min(maxX, Math.max(zone.x + APPLE_R, pts[k].x));
       pts[k].y = Math.min(zone.y + zone.h - APPLE_R, Math.max(zone.y + APPLE_R, pts[k].y));
     }
   }
@@ -1010,8 +1013,15 @@ function goHome() {
   longPress = null;
   homePress = null;
   celebrate = null;
+  celebrationType = null;
   transitionState = null;
   settleTimer = 0;
+  // 演出状態を画面外へ漏らさない: phase は BGM ダッキングの導出元、
+  // particles/animalBounce はメニュー滞在中に凍結して次の入場直後に再生されてしまう
+  phase = 'play';
+  particles = [];
+  animalBounce.L = 0;
+  animalBounce.R = 0;
 }
 
 function handlePointerDown(x, y) {
