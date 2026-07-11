@@ -300,6 +300,22 @@ function serve() {
     assert(s3.counts.right === countsBefore.right + 1, 'ground apple can still be placed');
   });
 
+  // --- v0.2監査 所見A: 皿の真下（動物・地面）でのリリースは皿へワープしない ---
+  await test('release on animal below plate: falls to ground, no warp to plate', async () => {
+    const s = await snap();
+    const apple = s.apples.find(a => a.state === 'field');
+    const before = s.counts;
+    await drag({ x: apple.x, y: apple.y }, { x: 190, y: 640 }); // 左の動物の体の上で放す
+    await waitFor(async () => {
+      const st = await snap();
+      const x = st.apples.find(z => z.id === apple.id);
+      return (x.state === 'ground' && x.y > 600) ? x : null;
+    }, 'apple falls to ground near animal (not onto plate)', 10_000);
+    const s2 = await snap();
+    assert(s2.counts.left === before.left && s2.counts.right === before.right,
+      `counts unchanged, got ${s2.counts.left}/${s2.counts.right} was ${before.left}/${before.right}`);
+  });
+
   await test('remove from plate: reversible + removedFromPlate count', async () => {
     const s = await snap();
     const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === 'L');
