@@ -100,19 +100,44 @@ async function tap(logical) {
 async function placeOneApple(apple, plateKey) {
   const before = await snap();
   const total = before.counts.left + before.counts.right;
-  await drag({ x: apple.x, y: apple.y }, before.plates[plateKey]);
-  await waitFor(async () => {
+  // 座標は最新スナップショットから取り直す（渡された座標は古い可能性がある）
+  const fresh = before.apples.find(a => a.id === apple.id) || apple;
+  await drag({ x: fresh.x, y: fresh.y }, before.plates[plateKey]);
+  try {
+    await waitFor(async () => {
+      const s = await snap();
+      return s.counts.left + s.counts.right > total;
+    }, `apple ${apple.id} lands on plate ${plateKey}`, 15_000);
+  } catch (e) {
+    // 失敗時は診断用に全状態を添える
     const s = await snap();
-    return s.counts.left + s.counts.right > total;
-  }, `apple ${apple.id} lands on plate ${plateKey}`);
+    const states = s.apples.map(a => ({ id: a.id, st: a.state, p: a.plate, x: Math.round(a.x), y: Math.round(a.y) }));
+    throw new Error(`${e.message} | phase=${s.phase} counts=${s.counts.left}/${s.counts.right} plates=${JSON.stringify(s.plates)} apples=${JSON.stringify(states)}`);
+  }
 }
 // 現在の問題を完了させる。assign(apple)→'L'|'R'
 async function completeProblem(assign) {
   for (;;) {
     const s = await snap();
     if (s.phase !== 'play') break;
-    const free = s.apples.find(a => a.state === 'field' || a.state === 'ground');
-    if (!free) break;
+    // field（静止）を優先。ground は落下中かもしれないので静止を確認してから拾う
+    let free = s.apples.find(a => a.state === 'field');
+    if (!free) {
+      const g = s.apples.find(a => a.state === 'ground');
+      if (!g) break;
+      const settled = await waitFor(async () => {
+        const s1 = await snap();
+        const a1 = s1.apples.find(x => x.id === g.id);
+        if (!a1 || a1.state !== 'ground') return { skip: true }; // 落下中に皿へ捕捉された等 → 外のループへ
+        await new Promise(r => setTimeout(r, 80));
+        const s2 = await snap();
+        const a2 = s2.apples.find(x => x.id === g.id);
+        if (!a2 || a2.state !== 'ground') return { skip: true };
+        return (Math.abs(a2.y - a1.y) < 2 && Math.abs(a2.x - a1.x) < 2) ? a2 : null;
+      }, `ground apple ${g.id} comes to rest`, 15_000);
+      if (settled.skip) continue;
+      free = settled;
+    }
     await placeOneApple(free, assign(free, s));
   }
   return waitFor(async () => {
