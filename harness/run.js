@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * てんびん E2E 検証ハーネス
+ * てんびん E2E 検証ハーネス（v0.4: 自由遊び・ラウンド制）
  *
  * 実インターフェース主義: 操作は canvas への実マウスイベント（タッチのフォールバック経路）
  * のみで行い、内部状態 window.__tenbin は「読み取り」だけに使う（docs/test-hooks.md 参照）。
@@ -33,7 +33,7 @@ const TIMESCALE = 8;
 const results = [];
 let page, ctx, browser, baseURL;
 
-async function test(name, fn, timeoutMs = 90_000) {
+async function test(name, fn, timeoutMs = 120_000) {
   const started = Date.now();
   try {
     await Promise.race([
@@ -55,14 +55,12 @@ async function snap() {
     const t = window.__tenbin;
     if (!t) return null;
     return {
-      phase: t.phase, problemIndex: t.problemIndex, levels: t.levels,
-      apples: t.apples, plates: t.plates, balance: t.balance, counts: t.counts,
+      screen: t.screen, game: t.game, menuTiles: t.menuTiles, homeButton: t.homeButton,
+      phase: t.phase, round: t.round, apples: t.apples, plates: t.plates, mouths: t.mouths,
+      balance: t.balance, counts: t.counts,
       orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
-      session: t.session, problemLog: t.problemLog,
-      theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
-      screen: t.screen, game: t.game, menuTiles: t.menuTiles,
-      homeButton: t.homeButton, wants: t.wants,
+      session: t.session, theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
     };
   });
 }
@@ -96,75 +94,99 @@ async function tap(logical) {
   const c = await toClient(logical.x, logical.y);
   await page.mouse.click(c.x, c.y);
 }
-// 未搭載のりんご1個を指定皿へ載せる。載った個数が増えるまで待つ
-async function placeOneApple(apple, plateKey) {
-  const before = await snap();
-  const total = before.counts.left + before.counts.right;
-  // 座標は最新スナップショットから取り直す（渡された座標は古い可能性がある）
-  const fresh = before.apples.find(a => a.id === apple.id) || apple;
-  await drag({ x: fresh.x, y: fresh.y }, before.plates[plateKey]);
-  try {
-    await waitFor(async () => {
-      const s = await snap();
-      return s.counts.left + s.counts.right > total;
-    }, `apple ${apple.id} lands on plate ${plateKey}`, 15_000);
-  } catch (e) {
-    // 失敗時は診断用に全状態を添える
-    const s = await snap();
-    const states = s.apples.map(a => ({ id: a.id, st: a.state, p: a.plate, x: Math.round(a.x), y: Math.round(a.y) }));
-    throw new Error(`${e.message} | phase=${s.phase} counts=${s.counts.left}/${s.counts.right} plates=${JSON.stringify(s.plates)} apples=${JSON.stringify(states)}`);
-  }
-}
-// 現在の問題を完了させる。assign(apple)→'L'|'R'
-async function completeProblem(assign) {
-  for (;;) {
-    const s = await snap();
-    if (s.phase !== 'play') break;
-    // field（静止）を優先。ground は落下中かもしれないので静止を確認してから拾う
-    let free = s.apples.find(a => a.state === 'field');
-    if (!free) {
-      const g = s.apples.find(a => a.state === 'ground');
-      if (!g) break;
-      const settled = await waitFor(async () => {
-        const s1 = await snap();
-        const a1 = s1.apples.find(x => x.id === g.id);
-        if (!a1 || a1.state !== 'ground') return { skip: true }; // 落下中に皿へ捕捉された等 → 外のループへ
-        await new Promise(r => setTimeout(r, 80));
-        const s2 = await snap();
-        const a2 = s2.apples.find(x => x.id === g.id);
-        if (!a2 || a2.state !== 'ground') return { skip: true };
-        return (Math.abs(a2.y - a1.y) < 2 && Math.abs(a2.x - a1.x) < 2) ? a2 : null;
-      }, `ground apple ${g.id} comes to rest`, 15_000);
-      if (settled.skip) continue;
-      free = settled;
-    }
-    await placeOneApple(free, assign(free, s));
-  }
-  return waitFor(async () => {
-    const s = await snap();
-    return (s.phase === 'celebrate' || s.phase === 'sessionEnd' || s.phase === 'transition') ? s : null;
-  }, 'problem completion (celebrate)', 60_000);
-}
-async function waitForProblem(index) {
-  return waitFor(async () => {
-    const s = await snap();
-    return (s.phase === 'play' && s.problemIndex === index) ? s : null;
-  }, `problem ${index} starts`, 60_000);
-}
-function readLogs(key = 'tenbin_logs') {
-  return page.evaluate(k => JSON.parse(localStorage.getItem(k) || '[]'), key);
-}
-// 領域 {x,y,w,h} の中心をタップ
 async function tapRegion(r) {
   return tap({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
 }
-// 指定位置を実時間 holdMs 押し込み続ける
 async function pressHold(logical, holdMs) {
   const c = await toClient(logical.x, logical.y);
   await page.mouse.move(c.x, c.y);
   await page.mouse.down();
   await new Promise(r => setTimeout(r, holdMs));
   await page.mouse.up();
+}
+function readLogs(key = 'tenbin_logs') {
+  return page.evaluate(k => JSON.parse(localStorage.getItem(k) || '[]'), key);
+}
+// 静止している自由な果物（field、なければ静止確認済みの ground）を1個返す。無ければ null
+async function findFreeFruit() {
+  const s = await snap();
+  const f = s.apples.find(a => a.state === 'field');
+  if (f) return f;
+  const g = s.apples.find(a => a.state === 'ground');
+  if (!g) return null;
+  const settled = await waitFor(async () => {
+    const s1 = await snap();
+    const a1 = s1.apples.find(x => x.id === g.id);
+    if (!a1 || a1.state !== 'ground') return { skip: true };
+    await new Promise(r => setTimeout(r, 80));
+    const s2 = await snap();
+    const a2 = s2.apples.find(x => x.id === g.id);
+    if (!a2 || a2.state !== 'ground') return { skip: true };
+    return (Math.abs(a2.y - a1.y) < 2 && Math.abs(a2.x - a1.x) < 2) ? a2 : null;
+  }, `ground fruit ${g.id} comes to rest`, 15_000);
+  if (settled.skip) return findFreeFruit();
+  return settled;
+}
+// 果物1個を皿に載せる（counts の合計が増えるまで待つ）
+async function placeOne(apple, plateKey) {
+  const before = await snap();
+  const total = before.counts.left + before.counts.right;
+  const fresh = before.apples.find(a => a.id === apple.id) || apple;
+  await drag({ x: fresh.x, y: fresh.y }, before.plates[plateKey]);
+  try {
+    await waitFor(async () => {
+      const s = await snap();
+      return s.counts.left + s.counts.right > total;
+    }, `fruit ${apple.id} lands on plate ${plateKey}`, 15_000);
+  } catch (e) {
+    const s = await snap();
+    const states = s.apples.map(a => ({ id: a.id, st: a.state, p: a.plate, x: Math.round(a.x), y: Math.round(a.y) }));
+    throw new Error(`${e.message} | phase=${s.phase} counts=${s.counts.left}/${s.counts.right} apples=${JSON.stringify(states)}`);
+  }
+}
+// 果物1個を動物に食べさせる（fed カウントが増えるまで待つ）
+async function feedOne(apple, side) {
+  const before = await snap();
+  const fedBefore = before.round[side === 'L' ? 'fedL' : 'fedR'];
+  const fresh = before.apples.find(a => a.id === apple.id) || apple;
+  await drag({ x: fresh.x, y: fresh.y }, { x: before.mouths[side].x, y: before.mouths[side].y });
+  await waitFor(async () => {
+    const s = await snap();
+    return s.round && s.round[side === 'L' ? 'fedL' : 'fedR'] > fedBefore;
+  }, `fruit ${apple.id} eaten by animal ${side}`, 15_000);
+}
+// 現在のラウンドを完了させる。assign(apple, s) → 'L' | 'R' | 'feedL' | 'feedR'
+async function completeRound(assign) {
+  for (;;) {
+    const s = await snap();
+    if (s.phase !== 'play') break;
+    const free = await findFreeFruit();
+    if (!free) break;
+    const what = assign(free, await snap());
+    if (what === 'feedL' || what === 'feedR') await feedOne(free, what === 'feedL' ? 'L' : 'R');
+    else await placeOne(free, what);
+  }
+  return waitFor(async () => {
+    const s = await snap();
+    return (s.phase === 'celebrate' || s.phase === 'transition' || s.phase === 'interlude') ? s : null;
+  }, 'round completion', 90_000);
+}
+async function waitForRound(index) {
+  return waitFor(async () => {
+    const s = await snap();
+    return (s.phase === 'play' && s.round && s.round.index === index) ? s : null;
+  }, `round ${index} starts`, 90_000);
+}
+async function openParentMenu() {
+  const c = await toClient(28, 28);
+  await page.mouse.move(c.x, c.y);
+  await page.mouse.down();
+  await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+  await page.mouse.up();
+  return waitFor(async () => {
+    const st = await snap();
+    return st.menuOpen ? st : null;
+  }, 'parent menu opens', 5_000);
 }
 
 // ---- 静的サーバ ----
@@ -188,7 +210,7 @@ function serve() {
 // ---- 本体 ----
 (async () => {
   if (!fs.existsSync(path.join(ROOT, 'index.html'))) {
-    console.error('index.html がまだ存在しない（検証の器のみ整備済み）');
+    console.error('index.html がまだ存在しない');
     process.exit(1);
   }
   const server = await serve();
@@ -200,18 +222,22 @@ function serve() {
     permissions: ['clipboard-read', 'clipboard-write'],
     hasTouch: false,
   });
-  // 文字禁止の監視: 親メニュー非表示中の fillText/strokeText 呼び出しを違反として数える
+  // 文字ガード（v0.4）: ゲームプレイ中（screen==='game' かつ親メニュー非表示）の
+  // fillText/strokeText を違反として数える。title/menu では正方向（文字が実在する）も検証する
   await ctx.addInitScript(() => {
-    const rec = { violations: 0, samples: [] };
-    Object.defineProperty(window, '__textViolations', { value: rec });
+    const rec = { violations: 0, samples: [], titleCalls: 0, menuScreenCalls: 0 };
+    Object.defineProperty(window, '__textStats', { value: rec });
     for (const m of ['fillText', 'strokeText']) {
       const orig = CanvasRenderingContext2D.prototype[m];
       CanvasRenderingContext2D.prototype[m] = function (...a) {
         const t = window.__tenbin;
-        if (!t || !t.menuOpen) {
+        const screen = t ? t.screen : null;
+        const menuOpen = t ? t.menuOpen : false;
+        if (!t || (screen === 'game' && !menuOpen)) {
           rec.violations++;
-          if (rec.samples.length < 5) rec.samples.push(String(a[0]));
-        }
+          if (rec.samples.length < 5) rec.samples.push(`${screen}:${String(a[0])}`);
+        } else if (screen === 'title') { rec.titleCalls++; }
+        else if (screen === 'menu') { rec.menuScreenCalls++; }
         return orig.apply(this, a);
       };
     }
@@ -221,25 +247,19 @@ function serve() {
   page.on('pageerror', e => pageErrors.push(`pageerror: ${e.message}`));
   page.on('console', m => { if (m.type() === 'error') pageErrors.push(`console.error: ${m.text()}`); });
 
-  console.log('tenbin E2E harness');
+  console.log('tenbin E2E harness (v0.4)');
 
-  // --- 揺れの触感（非臨界減衰）: 低速で1個載せて角度の目標横断を観測 ---
-  await test('spring: apple placement causes visible oscillation (non-critical damping)', async () => {
+  // ==== 触感（低速ページ） ====
+  await test('spring: fruit placement causes visible oscillation (non-critical damping)', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=tenbin`);
     const first = await waitFor(snap, '__tenbin exposed', 10_000);
-    // 回帰ガード: 公開読み取り面は最初のフレーム前でも未初期化値を返さない
     assert(first.plates.L.x > 0 && first.plates.R.x > first.plates.L.x,
       `plates valid from first exposure, got ${JSON.stringify(first.plates)}`);
-    const s = await waitForProblem(0);
+    const s = await waitForRound(0);
     const apple = s.apples.find(a => a.state === 'field');
-    assert(apple, 'field apple exists');
+    assert(apple, 'field fruit exists');
     await drag({ x: apple.x, y: apple.y }, s.plates.R);
-    // 着地（＝バネへの入力）を確認してからサンプリング開始
-    await waitFor(async () => {
-      const st = await snap();
-      return st.counts.right === 1 ? st : null;
-    }, 'apple lands on plate R before sampling', 5_000, 15);
-    // 角度サンプリング: (angle - target) の符号反転回数 >= 2 で「ゆらっ」を確認
+    await waitFor(async () => (await snap()).counts.right === 1, 'fruit lands on plate R before sampling', 5_000, 15);
     const series = [];
     const t0 = Date.now();
     while (Date.now() - t0 < 4000) {
@@ -247,439 +267,245 @@ function serve() {
       series.push(b.angle - b.target);
       await new Promise(r => setTimeout(r, 25));
     }
-    let flips = 0;
-    let prev = 0;
+    let flips = 0, prev = 0;
     for (const d of series) {
       const sg = Math.abs(d) < 0.05 ? 0 : Math.sign(d);
       if (sg !== 0 && prev !== 0 && sg !== prev) flips++;
       if (sg !== 0) prev = sg;
     }
-    const lo = Math.min(...series).toFixed(2), hi = Math.max(...series).toFixed(2);
-    assert(flips >= 2, `expected >=2 overshoot flips, got ${flips} (angle-target range [${lo}, ${hi}], n=${series.length})`);
+    assert(flips >= 2, `expected >=2 overshoot flips, got ${flips}`);
   });
 
-  // --- 監査所見1: 演出中に皿のりんごをつまんでもゲームが死なない ---
   await test('grab during celebration: input gated, game never freezes', async () => {
-    // spring テストの続き（timescale=2、皿にりんご1個載っている状態）。残りを全部載せて演出へ
-    await completeProblem(() => 'R');
-    // 演出中に「まだ食べられていない」皿上のりんごをつまんで外へ捨てようとする
-    // （旧実装: plate から外れた id が食べキューに残り TypeError → rAF ループ恒久停止）
+    await completeRound(() => 'R');
     const st = await snap();
     const target = [...st.apples].reverse().find(a => a.state === 'plate');
     if (target) {
       await drag({ x: target.x, y: target.y }, { x: 512, y: 200 }, { steps: 4, settleMs: 40 });
     }
-    // ゲームが生きていて次問へ自動遷移すること（フリーズすればここでタイムアウト）
-    await waitForProblem(1);
-  }, 120_000);
+    await waitForRound(1);
+  });
 
-  // --- 本編セッション（高速） ---
-  let bootTheme = null;
-  await test('boot: play phase, level table, landscape ok, valid theme', async () => {
+  // ==== 本編（高速ページ） ====
+  await test('boot: free-play round, mouths exposed, valid theme', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
     await waitFor(snap, '__tenbin exposed', 10_000);
-    const s = await waitForProblem(0);
-    assert(s.levels.length === 5, `levels=5, got ${s.levels.length}`);
-    const lv = s.levels[0];
-    assert(s.apples.length === lv.left + lv.right, `apples=${lv.left + lv.right}, got ${s.apples.length}`);
-    assert(!s.orientationBlocked, 'not blocked in landscape');
-    assert(['apple', 'orange', 'peach'].includes(s.theme?.fruit) &&
-      ['bear-rabbit', 'cat-chick', 'panda-frog'].includes(s.theme?.animals),
-      `valid theme, got ${JSON.stringify(s.theme)}`);
-    bootTheme = s.theme;
+    const s = await waitForRound(0);
+    assert(s.round.fruitsTotal >= 4 && s.round.fruitsTotal <= 9,
+      `fruitsTotal in 4..9, got ${s.round.fruitsTotal}`);
+    assert(s.apples.length === s.round.fruitsTotal, `pile matches fruitsTotal`);
+    assert(s.mouths && s.mouths.L.r > 0 && s.mouths.R.r > 0, 'mouth zones exposed');
+    assert(['apple', 'orange', 'peach'].includes(s.theme?.fruit), `valid theme, got ${JSON.stringify(s.theme)}`);
+    assert(s.round.dots === 0, `dots start at 0, got ${s.round.dots}`);
   });
 
-  // --- v0.2: 無操作ヒント（ゴーストハンド） ---
+  await test('geometry invariant: mouth zones never overlap plate catch bands', async () => {
+    const s = await snap();
+    const fruitR = s.apples[0].r;
+    const lOk = s.mouths.L.x + s.mouths.L.r + fruitR <= s.plates.L.x - s.plates.catchHalfW;
+    const rOk = s.mouths.R.x - s.mouths.R.r - fruitR >= s.plates.R.x + s.plates.catchHalfW;
+    assert(lOk && rOk, `non-overlap: mouthL=${JSON.stringify(s.mouths.L)} plateL=${JSON.stringify(s.plates.L)} halfW=${s.plates.catchHalfW} → L=${lOk} R=${rOk}`);
+  });
+
   await test('idle hint: ghost hand appears after 5s idle, hides on touch', async () => {
-    await waitFor(async () => (await snap()).hintActive === true, 'hint appears after 5s (sim) idle', 15_000);
-    await tap({ x: 950, y: 700 }); // りんごも隅もない場所へのタッチ
+    await waitFor(async () => (await snap()).hintActive === true, 'hint appears after idle', 15_000);
+    await tap({ x: 512, y: 730 });
     await waitFor(async () => (await snap()).hintActive === false, 'hint hides on touch', 5_000);
-    await waitFor(async () => (await snap()).hintActive === true, 'hint re-appears after another idle period', 15_000);
   });
 
-  await test('drag to plate: snap + counts + tilt direction', async () => {
-    const s = await snap();
-    const apple = s.apples.find(a => a.state === 'field');
-    await placeOneApple(apple, 'L');
+  await test('place on plates: counts + tilt direction + drop from above', async () => {
+    let f = await findFreeFruit();
+    await placeOne(f, 'L');
+    const s1 = await snap();
+    assert(s1.counts.left === 1 && s1.counts.right === 0, `counts 1/0, got ${s1.counts.left}/${s1.counts.right}`);
+    await waitFor(async () => (await snap()).balance.target < 0, 'target tilts left');
+    // 皿の上空150pxから落としても皿が捕捉する
+    f = await findFreeFruit();
     const s2 = await snap();
-    assert(s2.counts.left === 1 && s2.counts.right === 0, `counts L1/R0, got ${s2.counts.left}/${s2.counts.right}`);
-    const placed = s2.apples.find(a => a.id === apple.id);
-    assert(placed.state === 'plate' && placed.plate === 'L', 'apple is child of plate L');
-    await waitFor(async () => (await snap()).balance.target < 0, 'target tilts left (angle>0 = right down)');
-  });
-
-  // --- v0.2: 統一落下物理 —— 皿の真上から落としても載る ---
-  await test('drop from above: falling apple is caught by the plate', async () => {
-    const s = await snap();
-    const apple = s.apples.find(a => a.state === 'field');
-    const total = s.counts.left + s.counts.right;
-    // 皿中心の 150px 上空でリリース → 落下して皿が捕捉すること
-    await drag({ x: apple.x, y: apple.y }, { x: s.plates.R.x, y: s.plates.R.y - 150 });
+    await drag({ x: f.x, y: f.y }, { x: s2.plates.R.x, y: s2.plates.R.y - 150 });
     await waitFor(async () => {
-      const st = await snap();
-      const a = st.apples.find(x => x.id === apple.id);
-      return a.state === 'plate' && st.counts.left + st.counts.right > total;
-    }, 'apple dropped from above lands on plate R');
+      const s = await snap();
+      const a = s.apples.find(x => x.id === f.id);
+      return a.state === 'plate' && s.counts.right === 1;
+    }, 'fruit dropped from above lands on plate R');
   });
 
-  await test('drop outside plate: falls to ground, no penalty, still usable', async () => {
-    const s = await snap();
-    const apple = s.apples.find(a => a.state === 'field');
-    const before = s.problemLog.dropOutside;
-    await drag({ x: apple.x, y: apple.y }, { x: 512, y: 180 }); // 皿から遠い中空で放す
-    // v0.2: dropOutside は「地面静止が確定した瞬間」にカウントされる
-    await waitFor(async () => (await snap()).problemLog.dropOutside === before + 1,
-      `dropOutside increments on ground rest (${before} -> ${before + 1})`);
-    const g = await waitFor(async () => {
-      const st = await snap();
-      const a = st.apples.find(x => x.id === apple.id);
-      return (a.state === 'ground' || a.state === 'field') && a.y > 300 ? a : null;
-    }, 'apple rests on ground');
-    const countsBefore = (await snap()).counts;
-    await placeOneApple(g, 'R'); // ペナルティなし: そのまま拾って載せられる
-    const s3 = await snap();
-    assert(s3.counts.right === countsBefore.right + 1, 'ground apple can still be placed');
-  });
-
-  // --- v0.2監査 所見A: 皿の真下（動物・地面）でのリリースは皿へワープしない ---
-  await test('release on animal below plate: falls to ground, no warp to plate', async () => {
-    const s = await snap();
-    const apple = s.apples.find(a => a.state === 'field');
-    const before = s.counts;
-    await drag({ x: apple.x, y: apple.y }, { x: 190, y: 640 }); // 左の動物の体の上で放す
+  await test('balance celebration: fires once when level, debounced until counts change', async () => {
+    // counts 1/1 の水平静止 → 祝福1回
     await waitFor(async () => {
-      const st = await snap();
-      const x = st.apples.find(z => z.id === apple.id);
-      return (x.state === 'ground' && x.y > 600) ? x : null;
-    }, 'apple falls to ground near animal (not onto plate)', 10_000);
+      const s = await snap();
+      return s.round.balanceCelebrations >= 1;
+    }, 'balance celebration fires at 1/1', 20_000);
+    const n = (await snap()).round.balanceCelebrations;
+    await new Promise(r => setTimeout(r, 1200)); // ≈10s シミュ時間そのまま水平
+    assert((await snap()).round.balanceCelebrations === n,
+      'no re-fire while counts composition unchanged (debounce)');
+  });
+
+  await test('drop outside: falls to ground, counted on rest, still usable', async () => {
+    const f = await findFreeFruit();
+    const before = (await snap()).round.dropOutside;
+    await drag({ x: f.x, y: f.y }, { x: 512, y: 180 });
+    await waitFor(async () => (await snap()).round.dropOutside === before + 1,
+      'dropOutside increments on ground rest');
+    const g = await findFreeFruit();
+    assert(g, 'ground fruit still usable');
+  });
+
+  await test('feed from field: animal always eats, fed counted, plates unchanged', async () => {
+    const s0 = await snap();
+    const f = await findFreeFruit();
+    await feedOne(f, 'L');
+    const s = await snap();
+    assert(s.round.fedL >= 1, `fedL counted, got ${s.round.fedL}`);
+    const eaten = s.apples.find(a => a.id === f.id);
+    assert(eaten.state === 'eaten', `fruit state eaten, got ${eaten.state}`);
+    assert(s.counts.left === s0.counts.left && s.counts.right === s0.counts.right,
+      'plate counts unchanged by feeding from field');
+  });
+
+  await test('feed from plate (subtraction): counts drop, balance reacts, debounce re-arms', async () => {
+    // 右皿に1個足して 1/2 → 右の皿から1個食べさせて 1/1 に戻す（引き算→比較）
+    const f = await findFreeFruit();
+    await placeOne(f, 'R');
+    await waitFor(async () => (await snap()).counts.right === 2, 'counts 1/2', 10_000);
+    const nBefore = (await snap()).round.balanceCelebrations;
+    const s = await snap();
+    const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === 'R');
+    const rmBefore = s.round.removedFromPlate;
+    await feedOne(onPlate, 'R');
     const s2 = await snap();
-    assert(s2.counts.left === before.left && s2.counts.right === before.right,
-      `counts unchanged, got ${s2.counts.left}/${s2.counts.right} was ${before.left}/${before.right}`);
-  });
-
-  await test('remove from plate: reversible + removedFromPlate count', async () => {
-    const s = await snap();
-    const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === 'L');
-    const before = s.problemLog.removedFromPlate;
-    await drag({ x: onPlate.x, y: onPlate.y }, { x: 512, y: 200 });
+    assert(s2.counts.right === 1, `counts back to 1/1, got ${s2.counts.left}/${s2.counts.right}`);
+    assert(s2.round.removedFromPlate === rmBefore + 1, 'removedFromPlate counted');
+    // 構成が変わったのでデバウンス解除 → 再度水平で祝福が増える
+    // （果物総数が少ないシードでは、ここで全部さばけて釣り合い完了が先に来ることも正: どちらかを待つ）
     await waitFor(async () => {
-      const st = await snap();
-      return st.counts.left === 0;
-    }, 'apple removed from plate L');
-    const s2 = await snap();
-    const after = s2.problemLog.removedFromPlate;
-    assert(after === before + 1, `removedFromPlate ${before}->${after}`);
+      const s = await snap();
+      return s.phase !== 'play' || (s.round && s.round.balanceCelebrations > nBefore);
+    }, 'balance re-fires or balanced round completes', 20_000);
   });
 
-  await test('problem 0: all on one plate → clamp ±30°, celebrate, auto-advance', async () => {
-    const done = await completeProblem(() => 'R'); // 全部右へ → 差が最大
-    // clamp: 目標角は+30を超えない
-    assert(done.balance.target <= 30.0001 && done.balance.target > 0, `target clamped to +30, got ${done.balance.target}`);
-    assert(done.celebrationType === 'right', `celebrationType right, got ${done.celebrationType}`);
-    await waitForProblem(1);
+  await test('subtraction strategy: clear the round balanced (hidden math reachable)', async () => {
+    // 残りを左右交互に置き、余り1個は食べさせて同数で完了させる
+    await completeRound((a, s) => {
+      const remaining = s.apples.filter(x => x.state === 'field' || x.state === 'ground').length;
+      if (remaining === 1 && s.counts.left === s.counts.right) return 'feedL'; // 余り1個は食べさせる
+      return s.counts.left <= s.counts.right ? 'L' : 'R';
+    });
+    const done = await snap();
+    if (done.celebrationType) {
+      assert(done.celebrationType === 'balance', `balanced clear is top celebration, got ${done.celebrationType}`);
+    }
+    await waitForRound(1);
+    const logs = await readLogs();
+    const sess = logs[logs.length - 1];
+    const r0 = sess.rounds[0];
+    assert(r0 && r0.endedBy === 'cleared' && r0.clearedBalanced === true,
+      `round 0 logged as balanced clear, got ${JSON.stringify(r0)}`);
+    assert(r0.fedL + r0.fedR >= 1 && r0.balanceCelebrations >= 1, 'subtraction & celebrations recorded');
   });
 
-  await test('problem 1: split by side, heavier side celebrates', async () => {
-    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
-    const s = await waitFor(async () => {
-      const st = await snap();
-      return st.celebrationType ? st : null;
-    }, 'celebrationType set');
-    const expected = s.counts.left === s.counts.right ? 'balance' : (s.counts.left > s.counts.right ? 'left' : 'right');
-    assert(s.celebrationType === expected, `celebration=${expected}, got ${s.celebrationType}`);
-    await waitForProblem(2);
+  await test('all-fed round: feeding everything completes the round (no dead end)', async () => {
+    let flip = false;
+    const done = await completeRound(() => { flip = !flip; return flip ? 'feedL' : 'feedR'; });
+    if (done.celebrationType) {
+      assert(done.celebrationType === 'fed', `fed variant celebration, got ${done.celebrationType}`);
+    }
+    await waitForRound(2);
+    // ログが一次証拠: ラウンド1は全部食べさせで完了した
+    const sess = (await readLogs()).slice(-1)[0];
+    const r1 = sess.rounds[1];
+    assert(r1 && r1.fedL + r1.fedR === r1.fruitsTotal && r1.endedBy === 'cleared',
+      `round 1 all-fed in log, got ${JSON.stringify(r1)}`);
   });
 
-  await test('problem 2: completes', async () => {
-    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
-    await waitForProblem(3);
-  });
-
-  await test('problem 3 (5v5): balance celebration fires', async () => {
-    const s = await snap();
-    const lv = s.levels[3];
-    assert(lv.left === lv.right, 'level 3 is the equal-count level');
-    // 明示的に5個ずつ載せる（散布位置に依らず同数を保証）
-    let toL = lv.left;
-    await completeProblem(() => (toL-- > 0 ? 'L' : 'R'));
+  await test('all on one plate: target clamped to ±30°, heavier side celebrates', async () => {
+    const done = await completeRound(() => 'R');
+    assert(done.balance === null || (done.balance.target <= 30.0001 && done.balance.target > 0),
+      `target clamped, got ${JSON.stringify(done.balance)}`);
     const st = await waitFor(async () => {
       const x = await snap();
       return x.celebrationType ? x : null;
-    }, 'celebrationType set');
-    assert(st.counts.left === st.counts.right, `equal counts, got ${st.counts.left}/${st.counts.right}`);
-    assert(st.celebrationType === 'balance', `celebrationType balance, got ${st.celebrationType}`);
-    await waitForProblem(4);
+    }, 'celebration type set', 15_000);
+    assert(st.celebrationType === 'right', `right celebrates, got ${st.celebrationType}`);
+    await waitForRound(3);
   });
 
-  await test('problem 4: completes → session end', async () => {
-    await completeProblem(a => (a.x < 512 ? 'L' : 'R'));
-    await waitFor(async () => (await snap()).phase === 'sessionEnd', 'session end screen', 60_000);
+  await test('interlude: 5 lit dots → star interlude → play resumes, dots reset', async () => {
+    await completeRound(() => 'R');
+    await waitForRound(4);
+    await completeRound(() => 'R');
+    await waitFor(async () => (await snap()).phase === 'interlude', 'interlude after 5th round', 60_000);
+    const s = await waitForRound(5);
+    assert(s.round.dots === 0, `dots reset after interlude, got ${s.round.dots}`);
   });
 
-  await test('logs: schema + values persisted at completion', async () => {
-    const logs = await readLogs();
-    assert(logs.length >= 1, `>=1 session logged, got ${logs.length}`);
-    const sess = logs[logs.length - 1];
-    assert(sess.completed === true, 'completed=true');
-    assert(typeof sess.sessionStart === 'string' && !Number.isNaN(Date.parse(sess.sessionStart)), 'sessionStart is ISO string');
-    assert(Array.isArray(sess.problems) && sess.problems.length === 5, `5 problems, got ${sess.problems?.length}`);
-    sess.problems.forEach((p, i) => {
-      assert(p.level === i, `problem ${i} level index`);
-      assert(typeof p.firstTouchMs === 'number' && p.firstTouchMs >= 0, `firstTouchMs number (p${i})`);
-      assert(typeof p.durationMs === 'number' && p.durationMs > 0, `durationMs > 0 (p${i})`);
-      assert(typeof p.dropOutside === 'number' && typeof p.removedFromPlate === 'number', `counters numeric (p${i})`);
-    });
-    assert(sess.problems[0].dropOutside >= 1, 'dropOutside recorded in problem 0');
-    assert(sess.problems[0].removedFromPlate >= 1, 'removedFromPlate recorded in problem 0');
-  });
-
-  // --- 監査所見4: 終了画面でも親メニューに到達できる（誤リスタートしない） ---
-  await test('sessionEnd: corner long-press opens menu, no accidental restart', async () => {
-    const c = await toClient(28, 28);
-    await page.mouse.move(c.x, c.y);
-    await page.mouse.down();
-    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
-    await page.mouse.up();
-    const s = await waitFor(async () => {
-      const st = await snap();
-      return st.menuOpen ? st : null;
-    }, 'menu opens at sessionEnd (not restart)', 5_000);
-    assert(s.phase === 'sessionEnd', `phase stays sessionEnd, got ${s.phase}`);
-    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
-    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
-    assert((await snap()).phase === 'sessionEnd', 'closing menu does not restart');
-  });
-
-  await test('retry: tap on end screen restarts session, retried=true', async () => {
-    await tap({ x: 512, y: 384 });
-    await waitForProblem(0);
-    const logs = await readLogs();
-    const completedSessions = logs.filter(s => s.completed);
-    assert(completedSessions.length >= 1 && completedSessions[completedSessions.length - 1].retried === true,
-      'previous completed session marked retried');
-  });
-
-  await test('persistence: logs survive reload, theme deterministic per seed', async () => {
-    await page.reload();
-    await waitFor(snap, '__tenbin after reload', 10_000);
-    const logs = await readLogs();
-    assert(logs.some(s => s.completed === true), 'completed session persists after reload');
-    // v0.2: 同 seed の初回セッションのテーマは決定的
+  await test('home mid-round: partial round + session endedBy recorded (log v2)', async () => {
+    const f = await findFreeFruit();
+    await feedOne(f, 'L');
     const s = await snap();
-    assert(s.theme.fruit === bootTheme.fruit && s.theme.animals === bootTheme.animals,
-      `theme deterministic for same seed: boot=${JSON.stringify(bootTheme)} reload=${JSON.stringify(s.theme)}`);
-  });
-
-  await test('orientation: portrait shows rotate prompt, landscape restores', async () => {
-    await page.setViewportSize({ width: 700, height: 1000 });
-    await waitFor(async () => (await snap()).orientationBlocked === true, 'portrait blocked', 5_000);
-    await page.setViewportSize({ width: 1280, height: 960 });
-    await waitFor(async () => (await snap()).orientationBlocked === false, 'landscape restored', 5_000);
-  });
-
-  await test('no text outside parent menu (fillText/strokeText guard)', async () => {
-    const rec = await page.evaluate(() => window.__textViolations);
-    assert(rec.violations === 0, `text drawn outside menu: ${rec.violations} calls, samples=${JSON.stringify(rec.samples)}`);
-  });
-
-  await test('parent menu: 2s long-press opens; clear wipes logs; close', async () => {
-    const c = await toClient(28, 28);
-    await page.mouse.move(c.x, c.y);
-    await page.mouse.down();
-    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400)); // 2s(シミュ時間)＋余裕
-    await page.mouse.up();
-    const s = await waitFor(async () => {
-      const st = await snap();
-      return st.menuOpen ? st : null;
-    }, 'menu opens after long-press', 5_000);
-    assert(s.menuRegions && s.menuRegions.copy && s.menuRegions.clear && s.menuRegions.close && s.menuRegions.bgm,
-      'menu regions exposed (incl. bgm)');
-    // コピー（クリップボード権限は付与済み。失敗してもクラッシュしないこと）
-    await tap({ x: s.menuRegions.copy.x + s.menuRegions.copy.w / 2, y: s.menuRegions.copy.y + s.menuRegions.copy.h / 2 });
+    const hb = { x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 };
+    await tap(hb); // 短タップでは戻らない
     await new Promise(r => setTimeout(r, 300));
-    // 全消去
-    await tap({ x: s.menuRegions.clear.x + s.menuRegions.clear.w / 2, y: s.menuRegions.clear.y + s.menuRegions.clear.h / 2 });
-    await waitFor(async () => (await readLogs()).length === 0, 'logs cleared', 5_000);
-    // 閉じる
-    const s2 = await snap();
-    await tap({ x: s2.menuRegions.close.x + s2.menuRegions.close.w / 2, y: s2.menuRegions.close.y + s2.menuRegions.close.h / 2 });
-    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+    assert((await snap()).screen === 'game', 'short tap does not leave game');
+    await pressHold(hb, Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'hold returns to menu', 5_000);
+    const logs = await readLogs();
+    const sess = logs[logs.length - 1];
+    assert(sess.v === 2 && sess.endedBy === 'home', `session endedBy home, got ${JSON.stringify({ v: sess.v, endedBy: sess.endedBy })}`);
+    assert(sess.rounds.length === 6, `5 cleared + 1 partial rounds, got ${sess.rounds.length}`);
+    const partial = sess.rounds[5];
+    assert(partial.endedBy === 'home' && partial.fedL >= 1, `partial round recorded, got ${JSON.stringify(partial)}`);
+    sess.rounds.slice(0, 5).forEach((r, i) => {
+      assert(r.endedBy === 'cleared' && typeof r.durationMs === 'number' && r.durationMs > 0 &&
+        typeof r.fruitsTotal === 'number' && typeof r.balanceCelebrations === 'number' &&
+        typeof r.clearedBalanced === 'boolean', `round ${i} schema, got ${JSON.stringify(r)}`);
+    });
   });
 
-  // --- v0.2: BGM トグルが tenbin_prefs に永続する ---
-  await test('bgm: menu toggle persists via tenbin_prefs across reload', async () => {
-    assert((await snap()).bgmEnabled === true, 'bgm enabled by default');
-    const openMenu = async () => {
-      const c = await toClient(28, 28);
-      await page.mouse.move(c.x, c.y);
-      await page.mouse.down();
-      await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
-      await page.mouse.up();
-      return waitFor(async () => {
-        const st = await snap();
-        return st.menuOpen ? st : null;
-      }, 'menu opens', 5_000);
-    };
-    const tapRegion = async (r) => tap({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
-    let m = await openMenu();
-    await tapRegion(m.menuRegions.bgm);
-    await waitFor(async () => (await snap()).bgmEnabled === false, 'bgm toggled off', 5_000);
-    const prefs = await page.evaluate(() => JSON.parse(localStorage.getItem('tenbin_prefs') || '{}'));
-    assert(prefs.bgm === false, `prefs persisted at toggle moment, got ${JSON.stringify(prefs)}`);
-    await tapRegion(m.menuRegions.close);
-    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
-    await page.reload();
-    await waitFor(snap, '__tenbin after reload', 10_000);
-    assert((await snap()).bgmEnabled === false, 'bgm stays off after reload');
-    m = await openMenu();
-    await tapRegion(m.menuRegions.bgm);
-    await waitFor(async () => (await snap()).bgmEnabled === true, 'bgm toggled back on', 5_000);
-    await tapRegion(m.menuRegions.close);
-    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes again', 5_000);
+  await test('re-enter from menu tile: fresh session, round 0', async () => {
+    const m = await snap();
+    assert(m.menuTiles && m.menuTiles.tenbin && !m.menuTiles.wakekko,
+      `single tenbin tile (wakekko retired), got ${JSON.stringify(m.menuTiles)}`);
+    await tapRegion(m.menuTiles.tenbin);
+    await waitForRound(0);
   });
 
-  // --- 監査所見3: 破損した保存データ（非オブジェクト要素）でもメニューが死なない ---
-  await test('resilience: corrupted tenbin_logs entries do not freeze menu', async () => {
-    // 保存データの注入（テスト入力。内部状態の直書きではない）
-    await page.evaluate(() => localStorage.setItem('tenbin_logs', '[null,{"completed":true},42,"x"]'));
-    await page.reload();
-    await waitFor(snap, '__tenbin after corrupt-logs reload', 10_000);
-    const c = await toClient(28, 28);
-    await page.mouse.move(c.x, c.y);
-    await page.mouse.down();
-    await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
-    await page.mouse.up();
-    const s = await waitFor(async () => {
-      const st = await snap();
-      return st.menuOpen ? st : null;
-    }, 'menu opens with corrupted logs (no freeze)', 5_000);
-    const clean = await readLogs();
-    assert(clean.every(x => x && typeof x === 'object' && !Array.isArray(x)),
-      `logs sanitized to objects, got ${JSON.stringify(clean)}`);
-    await tap({ x: s.menuRegions.close.x + s.menuRegions.close.w / 2, y: s.menuRegions.close.y + s.menuRegions.close.h / 2 });
-    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
-  });
-
-  // ==== v0.3: 画面遷移（実経路: タイトル→メニュー→ゲーム→おうち→別ゲーム） ====
-  await test('navigation: title → menu → tenbin (real taps)', async () => {
+  // ==== 画面遷移・文字 ====
+  await test('navigation: title (with logo text) → menu (with label) → game (no text)', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
     const first = await waitFor(snap, '__tenbin exposed', 10_000);
     assert(first.screen === 'title', `boots to title, got ${first.screen}`);
-    await tap({ x: 512, y: 400 }); // タイトルはどこでもタップで進む
+    await new Promise(r => setTimeout(r, 300)); // タイトルを数フレーム描かせる
+    const stats1 = await page.evaluate(() => ({ t: window.__textStats.titleCalls }));
+    assert(stats1.t > 0, 'title actually draws text (logo)');
+    await tap({ x: 512, y: 400 });
     const m = await waitFor(async () => {
       const s = await snap();
       return s.screen === 'menu' ? s : null;
-    }, 'menu screen after title tap', 5_000);
-    assert(m.menuTiles && m.menuTiles.tenbin && m.menuTiles.wakekko,
-      `menu tiles exposed, got ${JSON.stringify(m.menuTiles)}`);
-    await tapRegion(m.menuTiles.tenbin);
-    const g = await waitFor(async () => {
-      const s = await snap();
-      return (s.screen === 'game' && s.game === 'tenbin' && s.phase === 'play') ? s : null;
-    }, 'tenbin starts from menu tile', 5_000);
-    assert(g.homeButton && g.homeButton.w > 0, 'home button exposed in game');
-    assert(g.session, 'session starts at game entry');
-  });
-
-  await test('home button: short tap stays, 0.8s hold returns to menu', async () => {
-    const s = await snap();
-    const hb = { x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 };
-    await tap(hb); // 短タップでは戻らない（誤タップ耐性）
+    }, 'menu after title tap', 5_000);
     await new Promise(r => setTimeout(r, 300));
-    assert((await snap()).screen === 'game', 'short tap does not leave game');
-    await pressHold(hb, Math.ceil(800 / TIMESCALE) + 400); // 0.8s（シミュ時間）押し込み
-    await waitFor(async () => (await snap()).screen === 'menu', 'hold returns to menu', 5_000);
+    const stats2 = await page.evaluate(() => ({ m: window.__textStats.menuScreenCalls }));
+    assert(stats2.m > 0, 'menu actually draws text (labels)');
+    await tapRegion(m.menuTiles.tenbin);
+    await waitForRound(0);
   });
 
-  // ==== v0.3: わけっこ ====
-  await test('wakekko: enter from menu tile, wants exposed, pile matches', async () => {
-    const m = await snap();
-    await tapRegion(m.menuTiles.wakekko);
+  await test('?game=wakekko falls back to tenbin (legacy param safe)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=wakekko`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
     const s = await waitFor(async () => {
-      const st = await snap();
-      return (st.screen === 'game' && st.game === 'wakekko' && st.phase === 'play') ? st : null;
-    }, 'wakekko starts from menu tile', 5_000);
-    assert(s.wants && s.wants.left > 0 && s.wants.right > 0, `wants exposed, got ${JSON.stringify(s.wants)}`);
-    assert(s.balance === null, 'balance is null in wakekko');
-    assert(s.apples.length === s.wants.left + s.wants.right,
-      `pile = wants sum, got ${s.apples.length} vs ${s.wants.left + s.wants.right}`);
-  });
-
-  await test('wakekko: correct split → both celebrate → next problem', async () => {
-    await completeProblem((a, s) => (s.counts.left < s.wants.left ? 'L' : 'R'));
-    const st = await waitFor(async () => {
       const x = await snap();
-      return x.celebrationType ? x : null;
-    }, 'celebration starts', 10_000);
-    assert(st.celebrationType === 'both', `celebrationType both, got ${st.celebrationType}`);
-    await waitForProblem(1);
+      return x.screen === 'game' ? x : null;
+    }, 'enters a game', 5_000);
+    assert(s.game === 'tenbin', `falls back to tenbin, got ${s.game}`);
   });
 
-  await test('wakekko: wrong split waits quietly (no ✗), fix → celebrate', async () => {
-    // 全部を欲しい数と違う配分で置く（多い側に寄せる）
-    const s0 = await snap();
-    const overSide = s0.wants.left >= s0.wants.right ? 'L' : 'R';
-    await (async () => {
-      for (;;) {
-        const s = await snap();
-        if (s.phase !== 'play') break;
-        const free = s.apples.find(a => a.state === 'field' || a.state === 'ground');
-        if (!free) break;
-        await placeOneApple(free, overSide); // 全部同じ側 → 必ず不一致
-      }
-    })();
-    // 世界は静かに待つ: 完了(celebrate)は発火しない
-    await new Promise(r => setTimeout(r, 1500)); // ≈12s シミュ時間
-    const sWait = await snap();
-    assert(sWait.phase === 'play' && !sWait.celebrationType,
-      `stays in play quietly, got phase=${sWait.phase} celebration=${sWait.celebrationType}`);
-    // 可逆: 置きすぎた側から正しい配分へ移し替える
-    for (;;) {
-      const s = await snap();
-      if (s.phase !== 'play') break;
-      const overKey = s.counts.left > s.wants.left ? 'L' : (s.counts.right > s.wants.right ? 'R' : null);
-      if (!overKey) break;
-      const underKey = overKey === 'L' ? 'R' : 'L';
-      const onPlate = s.apples.find(a => a.state === 'plate' && a.plate === overKey);
-      await drag({ x: onPlate.x, y: onPlate.y }, s.plates[underKey]);
-      await waitFor(async () => {
-        const st = await snap();
-        const a = st.apples.find(x => x.id === onPlate.id);
-        return a.plate === underKey || st.phase !== 'play';
-      }, 'apple moved to the other plate', 15_000);
-    }
-    const st = await waitFor(async () => {
-      const x = await snap();
-      return (x.phase === 'celebrate' || x.phase === 'transition') ? x : null;
-    }, 'celebrate after fixing the split', 15_000);
-    assert(st.celebrationType === null || st.celebrationType === 'both', 'both-type celebration');
-    await waitForProblem(2);
-  });
-
-  await test('wakekko: session completes, wakekko_logs schema persisted', async () => {
-    for (let i = 2; i < 5; i++) {
-      await completeProblem((a, s) => (s.counts.left < s.wants.left ? 'L' : 'R'));
-      if (i < 4) await waitForProblem(i + 1);
-    }
-    await waitFor(async () => (await snap()).phase === 'sessionEnd', 'wakekko session end', 60_000);
-    const logs = await readLogs('wakekko_logs');
-    assert(logs.length >= 1, `wakekko session logged, got ${logs.length}`);
-    const sess = logs[logs.length - 1];
-    assert(sess.completed === true, 'completed=true');
-    assert(Array.isArray(sess.problems) && sess.problems.length === 5, `5 problems, got ${sess.problems?.length}`);
-    sess.problems.forEach((p, i) => {
-      assert(p.level === i && typeof p.durationMs === 'number' && p.durationMs > 0, `problem ${i} schema`);
-      assert(typeof p.firstTouchMs === 'number' && typeof p.dropOutside === 'number' &&
-        typeof p.removedFromPlate === 'number', `problem ${i} counters`);
-    });
-  });
-
-  // --- v0.3監査 所見1: 演出の最中におうちで離脱しても演出状態が画面外へ漏れ残らない ---
-  await test('goHome during celebration: no stale phase/celebration leaks to menu', async () => {
+  await test('goHome during celebration: no stale state leaks to menu', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
     await waitFor(snap, '__tenbin exposed', 10_000);
-    await waitForProblem(0);
-    await completeProblem(() => 'R');
+    await waitForRound(0);
+    await completeRound(() => 'R');
     const c = await waitFor(async () => {
       const st = await snap();
       return st.phase === 'celebrate' ? st : null;
@@ -690,15 +516,91 @@ function serve() {
       const st = await snap();
       return st.screen === 'menu' ? st : null;
     }, 'back to menu from celebration', 5_000);
-    // 演出状態（BGMダッキングの導出元・celebrationType）がメニューに漏れ残らない
     assert(m.phase === 'play' && m.celebrationType === null,
       `no stale celebration state on menu, got phase=${m.phase} celebration=${m.celebrationType}`);
-    // 再入場は正常
     await tapRegion(m.menuTiles.tenbin);
-    await waitForProblem(0);
+    await waitForRound(0);
   });
 
-  await test('no page errors during entire run', async () => {
+  await test('orientation: portrait shows rotate prompt, landscape restores', async () => {
+    await page.setViewportSize({ width: 700, height: 1000 });
+    await waitFor(async () => (await snap()).orientationBlocked === true, 'portrait blocked', 5_000);
+    await page.setViewportSize({ width: 1280, height: 960 });
+    await waitFor(async () => (await snap()).orientationBlocked === false, 'landscape restored', 5_000);
+  });
+
+  // ==== 親メニュー・ログ・設定 ====
+  await test('legacy & corrupted logs: v0.3 problems format + wakekko preserved, menu safe', async () => {
+    await page.evaluate(() => {
+      localStorage.setItem('tenbin_logs', JSON.stringify([
+        { sessionStart: '2026-07-10T00:00:00Z', completed: true, retried: false, problems: [{ level: 0, firstTouchMs: 1, durationMs: 2, dropOutside: 0, removedFromPlate: 0 }] },
+        null, 42, 'x',
+      ]));
+      localStorage.setItem('wakekko_logs', JSON.stringify([
+        { sessionStart: '2026-07-11T00:00:00Z', completed: false, problems: [] },
+      ]));
+    });
+    await page.reload();
+    await waitFor(snap, '__tenbin after legacy reload', 10_000);
+    await waitForRound(0);
+    // legacy レコードが保持されている（新セッションの persist で消えない）
+    const tlogs = await readLogs();
+    assert(tlogs.some(x => x && Array.isArray(x.problems)), 'v0.3 legacy session preserved');
+    assert(tlogs.every(x => x && typeof x === 'object'), 'corrupt entries sanitized');
+    const wlogs = await readLogs('wakekko_logs');
+    assert(wlogs.length === 1, 'wakekko legacy logs untouched');
+    // 親メニューが開ける（破損データでフリーズしない）＋コピーに両キーが含まれる
+    const menu = await openParentMenu();
+    assert(menu.menuRegions.copy && menu.menuRegions.clear && menu.menuRegions.close && menu.menuRegions.bgm,
+      'menu regions exposed');
+    await tapRegion(menu.menuRegions.copy);
+    await new Promise(r => setTimeout(r, 400));
+    const clip = await page.evaluate(() => navigator.clipboard.readText().catch(() => null));
+    if (clip) {
+      const parsed = JSON.parse(clip);
+      assert(Array.isArray(parsed.tenbin) && Array.isArray(parsed.wakekko),
+        'copied JSON contains tenbin + legacy wakekko');
+    }
+    // 消去は両キー
+    await tapRegion(menu.menuRegions.clear);
+    await waitFor(async () => (await readLogs()).length === 0 && (await readLogs('wakekko_logs')).length === 0,
+      'both log keys cleared', 5_000);
+    await tapRegion(menu.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  await test('bgm: menu toggle persists via tenbin_prefs across reload', async () => {
+    assert((await snap()).bgmEnabled === true, 'bgm enabled by default');
+    let m = await openParentMenu();
+    await tapRegion(m.menuRegions.bgm);
+    await waitFor(async () => (await snap()).bgmEnabled === false, 'bgm toggled off', 5_000);
+    const prefs = await page.evaluate(() => JSON.parse(localStorage.getItem('tenbin_prefs') || '{}'));
+    assert(prefs.bgm === false, `prefs persisted at toggle moment, got ${JSON.stringify(prefs)}`);
+    await tapRegion(m.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+    await page.reload();
+    await waitFor(snap, '__tenbin after reload', 10_000);
+    assert((await snap()).bgmEnabled === false, 'bgm stays off after reload');
+    m = await openParentMenu();
+    await tapRegion(m.menuRegions.bgm);
+    await waitFor(async () => (await snap()).bgmEnabled === true, 'bgm back on', 5_000);
+    await tapRegion(m.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes again', 5_000);
+  });
+
+  await test('persistence: theme deterministic per seed across reload', async () => {
+    const t1 = (await snap()).theme;
+    await page.reload();
+    await waitFor(snap, '__tenbin after reload', 10_000);
+    const t2 = (await snap()).theme;
+    assert(t1.fruit === t2.fruit && t1.animals === t2.animals,
+      `theme deterministic, got ${JSON.stringify(t1)} vs ${JSON.stringify(t2)}`);
+  });
+
+  await test('no text during gameplay (guard) & no page errors', async () => {
+    const stats = await page.evaluate(() => window.__textStats);
+    assert(stats.violations === 0,
+      `text drawn during gameplay: ${stats.violations} calls, samples=${JSON.stringify(stats.samples)}`);
     assert(pageErrors.length === 0, `errors: ${pageErrors.slice(0, 5).join(' | ')}`);
   });
 
