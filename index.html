@@ -676,8 +676,30 @@ function loadLogs(key) {
     if (!raw) return [];
     var parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    // 破損データ耐性: 非オブジェクト要素は捨てる（falsy 安全）
-    return parsed.filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); });
+    // 破損データ耐性: 非オブジェクト要素は捨て、v2 の数値フィールドは読み込み時に正規化する
+    // （文字列数値の混入で統計が文字列連結になるのを防ぐ。監査F3）
+    return parsed
+      .filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); })
+      .map(function (s) {
+        if (s.v === 2 && Array.isArray(s.rounds)) {
+          s.rounds = s.rounds
+            .filter(function (r) { return r && typeof r === 'object'; })
+            .map(function (r) {
+              return {
+                fruitsTotal: Number(r.fruitsTotal) || 0,
+                fedL: Number(r.fedL) || 0,
+                fedR: Number(r.fedR) || 0,
+                balanceCelebrations: Number(r.balanceCelebrations) || 0,
+                clearedBalanced: !!r.clearedBalanced,
+                dropOutside: Number(r.dropOutside) || 0,
+                removedFromPlate: Number(r.removedFromPlate) || 0,
+                durationMs: Number(r.durationMs) || 0,
+                endedBy: r.endedBy === 'home' ? 'home' : 'cleared'
+              };
+            });
+        }
+        return s;
+      });
   } catch (e) { return []; }
 }
 function persistLogsFor(game) {
@@ -743,9 +765,14 @@ function snapToPlate(a, side) {
   playPlace();
 }
 
-// v0.4: 口ゾーン(食べさせ=引き算の捕捉円)。果物の実位置基準で判定する
+// v0.4: 口ゾーン(食べさせ=引き算の捕捉域)。果物の実位置基準で判定する。
+// 円ではなく「口から足元までの縦カプセル」——体のどこに渡しても食べる
+// （足元だけ食べない帯は「拒食に見える応答の空白」になる。監査F2）。
+// 水平方向の張り出しは r のまま＝皿捕捉帯との非重複 invariant は不変
+var MOUTH_FOOT_Y = 700; // 地面。カプセル下端
 function mouthContains(mouth, x, y) {
-  var dx = x - mouth.x, dy = y - mouth.y;
+  var cy = Math.max(mouth.y, Math.min(MOUTH_FOOT_Y, y));
+  var dx = x - mouth.x, dy = y - cy;
   return Math.sqrt(dx * dx + dy * dy) <= mouth.r + APPLE_R;
 }
 function findMouthAt(x, y) {
@@ -1125,7 +1152,11 @@ function enterGame() {
 // 前回入場時の状態が次回に漏れないようにする。進行中(未記録)のラウンドがあれば
 // endedBy:'home' で確定push、セッションにも endedBy:'home' を書いて同期的にpersistする
 function goHome() {
-  if (round && !round.recorded && session) {
+  // 未着手ラウンド（ロールイン直後など、何の操作痕もない）は記録しない——
+  // 統計のラウンド数を実プレイから乖離させない（監査F1）
+  var touched = round && (round.fedL + round.fedR + round.dropOutside + round.removedFromPlate +
+    round.balanceCelebrations + counts.left + counts.right > 0);
+  if (round && !round.recorded && session && touched) {
     session.rounds.push(roundToRecord(round, 'home', null));
     round.recorded = true;
   }
@@ -2056,8 +2087,8 @@ function installTenbinHook() {
     mouths: {
       enumerable: true, get: function () {
         return {
-          L: { x: MOUTHS.L.x, y: MOUTHS.L.y, r: MOUTHS.L.r },
-          R: { x: MOUTHS.R.x, y: MOUTHS.R.y, r: MOUTHS.R.r }
+          L: { x: MOUTHS.L.x, y: MOUTHS.L.y, r: MOUTHS.L.r, footY: MOUTH_FOOT_Y },
+          R: { x: MOUTHS.R.x, y: MOUTHS.R.y, r: MOUTHS.R.r, footY: MOUTH_FOOT_Y }
         };
       }
     },
