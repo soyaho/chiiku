@@ -58,6 +58,7 @@ async function snap() {
       orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
       session: t.session, problemLog: t.problemLog,
+      theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
     };
   });
 }
@@ -232,7 +233,8 @@ function serve() {
   }, 120_000);
 
   // --- 本編セッション（高速） ---
-  await test('boot: play phase, level table, landscape ok', async () => {
+  let bootTheme = null;
+  await test('boot: play phase, level table, landscape ok, valid theme', async () => {
     await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
     await waitFor(snap, '__tenbin exposed', 10_000);
     const s = await waitForProblem(0);
@@ -240,6 +242,18 @@ function serve() {
     const lv = s.levels[0];
     assert(s.apples.length === lv.left + lv.right, `apples=${lv.left + lv.right}, got ${s.apples.length}`);
     assert(!s.orientationBlocked, 'not blocked in landscape');
+    assert(['apple', 'orange', 'peach'].includes(s.theme?.fruit) &&
+      ['bear-rabbit', 'cat-chick', 'panda-frog'].includes(s.theme?.animals),
+      `valid theme, got ${JSON.stringify(s.theme)}`);
+    bootTheme = s.theme;
+  });
+
+  // --- v0.2: 無操作ヒント（ゴーストハンド） ---
+  await test('idle hint: ghost hand appears after 5s idle, hides on touch', async () => {
+    await waitFor(async () => (await snap()).hintActive === true, 'hint appears after 5s (sim) idle', 15_000);
+    await tap({ x: 950, y: 700 }); // りんごも隅もない場所へのタッチ
+    await waitFor(async () => (await snap()).hintActive === false, 'hint hides on touch', 5_000);
+    await waitFor(async () => (await snap()).hintActive === true, 'hint re-appears after another idle period', 15_000);
   });
 
   await test('drag to plate: snap + counts + tilt direction', async () => {
@@ -253,22 +267,53 @@ function serve() {
     await waitFor(async () => (await snap()).balance.target < 0, 'target tilts left (angle>0 = right down)');
   });
 
+  // --- v0.2: 統一落下物理 —— 皿の真上から落としても載る ---
+  await test('drop from above: falling apple is caught by the plate', async () => {
+    const s = await snap();
+    const apple = s.apples.find(a => a.state === 'field');
+    const total = s.counts.left + s.counts.right;
+    // 皿中心の 150px 上空でリリース → 落下して皿が捕捉すること
+    await drag({ x: apple.x, y: apple.y }, { x: s.plates.R.x, y: s.plates.R.y - 150 });
+    await waitFor(async () => {
+      const st = await snap();
+      const a = st.apples.find(x => x.id === apple.id);
+      return a.state === 'plate' && st.counts.left + st.counts.right > total;
+    }, 'apple dropped from above lands on plate R');
+  });
+
   await test('drop outside plate: falls to ground, no penalty, still usable', async () => {
     const s = await snap();
     const apple = s.apples.find(a => a.state === 'field');
     const before = s.problemLog.dropOutside;
     await drag({ x: apple.x, y: apple.y }, { x: 512, y: 180 }); // 皿から遠い中空で放す
+    // v0.2: dropOutside は「地面静止が確定した瞬間」にカウントされる
+    await waitFor(async () => (await snap()).problemLog.dropOutside === before + 1,
+      `dropOutside increments on ground rest (${before} -> ${before + 1})`);
     const g = await waitFor(async () => {
       const st = await snap();
       const a = st.apples.find(x => x.id === apple.id);
       return (a.state === 'ground' || a.state === 'field') && a.y > 300 ? a : null;
-    }, 'apple falls and rests on ground');
-    const s2 = await snap();
-    const after = s2.problemLog.dropOutside;
-    assert(after === before + 1, `dropOutside ${before}->${after}`);
+    }, 'apple rests on ground');
+    const countsBefore = (await snap()).counts;
     await placeOneApple(g, 'R'); // ペナルティなし: そのまま拾って載せられる
     const s3 = await snap();
-    assert(s3.counts.right === 1, 'ground apple can still be placed');
+    assert(s3.counts.right === countsBefore.right + 1, 'ground apple can still be placed');
+  });
+
+  // --- v0.2監査 所見A: 皿の真下（動物・地面）でのリリースは皿へワープしない ---
+  await test('release on animal below plate: falls to ground, no warp to plate', async () => {
+    const s = await snap();
+    const apple = s.apples.find(a => a.state === 'field');
+    const before = s.counts;
+    await drag({ x: apple.x, y: apple.y }, { x: 190, y: 640 }); // 左の動物の体の上で放す
+    await waitFor(async () => {
+      const st = await snap();
+      const x = st.apples.find(z => z.id === apple.id);
+      return (x.state === 'ground' && x.y > 600) ? x : null;
+    }, 'apple falls to ground near animal (not onto plate)', 10_000);
+    const s2 = await snap();
+    assert(s2.counts.left === before.left && s2.counts.right === before.right,
+      `counts unchanged, got ${s2.counts.left}/${s2.counts.right} was ${before.left}/${before.right}`);
   });
 
   await test('remove from plate: reversible + removedFromPlate count', async () => {
@@ -373,11 +418,15 @@ function serve() {
       'previous completed session marked retried');
   });
 
-  await test('persistence: logs survive reload', async () => {
+  await test('persistence: logs survive reload, theme deterministic per seed', async () => {
     await page.reload();
     await waitFor(snap, '__tenbin after reload', 10_000);
     const logs = await readLogs();
     assert(logs.some(s => s.completed === true), 'completed session persists after reload');
+    // v0.2: 同 seed の初回セッションのテーマは決定的
+    const s = await snap();
+    assert(s.theme.fruit === bootTheme.fruit && s.theme.animals === bootTheme.animals,
+      `theme deterministic for same seed: boot=${JSON.stringify(bootTheme)} reload=${JSON.stringify(s.theme)}`);
   });
 
   await test('orientation: portrait shows rotate prompt, landscape restores', async () => {
@@ -402,7 +451,8 @@ function serve() {
       const st = await snap();
       return st.menuOpen ? st : null;
     }, 'menu opens after long-press', 5_000);
-    assert(s.menuRegions && s.menuRegions.copy && s.menuRegions.clear && s.menuRegions.close, 'menu regions exposed');
+    assert(s.menuRegions && s.menuRegions.copy && s.menuRegions.clear && s.menuRegions.close && s.menuRegions.bgm,
+      'menu regions exposed (incl. bgm)');
     // コピー（クリップボード権限は付与済み。失敗してもクラッシュしないこと）
     await tap({ x: s.menuRegions.copy.x + s.menuRegions.copy.w / 2, y: s.menuRegions.copy.y + s.menuRegions.copy.h / 2 });
     await new Promise(r => setTimeout(r, 300));
@@ -413,6 +463,38 @@ function serve() {
     const s2 = await snap();
     await tap({ x: s2.menuRegions.close.x + s2.menuRegions.close.w / 2, y: s2.menuRegions.close.y + s2.menuRegions.close.h / 2 });
     await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  // --- v0.2: BGM トグルが tenbin_prefs に永続する ---
+  await test('bgm: menu toggle persists via tenbin_prefs across reload', async () => {
+    assert((await snap()).bgmEnabled === true, 'bgm enabled by default');
+    const openMenu = async () => {
+      const c = await toClient(28, 28);
+      await page.mouse.move(c.x, c.y);
+      await page.mouse.down();
+      await new Promise(r => setTimeout(r, Math.ceil(2000 / TIMESCALE) + 400));
+      await page.mouse.up();
+      return waitFor(async () => {
+        const st = await snap();
+        return st.menuOpen ? st : null;
+      }, 'menu opens', 5_000);
+    };
+    const tapRegion = async (r) => tap({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+    let m = await openMenu();
+    await tapRegion(m.menuRegions.bgm);
+    await waitFor(async () => (await snap()).bgmEnabled === false, 'bgm toggled off', 5_000);
+    const prefs = await page.evaluate(() => JSON.parse(localStorage.getItem('tenbin_prefs') || '{}'));
+    assert(prefs.bgm === false, `prefs persisted at toggle moment, got ${JSON.stringify(prefs)}`);
+    await tapRegion(m.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+    await page.reload();
+    await waitFor(snap, '__tenbin after reload', 10_000);
+    assert((await snap()).bgmEnabled === false, 'bgm stays off after reload');
+    m = await openMenu();
+    await tapRegion(m.menuRegions.bgm);
+    await waitFor(async () => (await snap()).bgmEnabled === true, 'bgm toggled back on', 5_000);
+    await tapRegion(m.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes again', 5_000);
   });
 
   // --- 監査所見3: 破損した保存データ（非オブジェクト要素）でもメニューが死なない ---

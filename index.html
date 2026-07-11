@@ -46,9 +46,18 @@ var LEVELS = [
 var PIVOT = { x: 512, y: 300 };
 var ARM_LEN = 230;
 var ROD_LEN = 90;
-var PLATE_SNAP_R = 120;
+// v0.2: 「皿中心120pxで即スナップ」は廃止(統一落下物理)。
+// 皿の捕捉は「見た目幅の半分+寛容マージン」の横幅と、皿面付近の高さ帯の通過で判定する
+var PLATE_DISH_RX = 78;
+var PLATE_DISH_RY = 22;
+var PLATE_CATCH_MARGIN = 35;
+var PLATE_CATCH_HALF_W = PLATE_DISH_RX + PLATE_CATCH_MARGIN; // 113
+var PLATE_CATCH_BAND_OFFSET = 26; // 捕捉判定の基準線 = 皿面中心 - この値
+var DRAG_RELEASE_VEL_SCALE = 0.5; // 指の移動速度→初速への引き継ぎ率
+var DRAG_RELEASE_VEL_CAP = 400;   // px/s cap
 var APPLE_R = 26;
 var APPLE_TOUCH_R = 62;
+var PLATE_CATCH_BELOW = PLATE_DISH_RY + APPLE_R + 14; // 即着地帯の下限（皿の厚み＋果物半径＋余白）
 var GROUND_Y = 700;
 var GRAVITY = 1000;
 var FOLLOW_RATE = -Math.log(1 - 0.4) * 60; // per-second lerp rate equivalent to 0.4/frame@60fps
@@ -57,6 +66,17 @@ var LEFT_ZONE = { x: 70, y: 108, w: 330, h: 172 };
 var RIGHT_ZONE = { x: 624, y: 108, w: 330, h: 172 };
 var BEAR_POS = { x: 190, y: 660 };
 var RABBIT_POS = { x: 834, y: 660 };
+
+// v0.2: 無操作ヒント(ゴーストハンド)
+var HINT_DELAY_MS = 5000;   // 無操作からヒント表示までのシミュレーション時間
+var HINT_CYCLE_MS = 1600;   // 1ループの長さ
+
+// v0.2: テーマバリエーション(果物3種 x 動物ペア3種。セッション開始ごとにゲームRNGで選択)
+var FRUIT_LIST = ['apple', 'orange', 'peach'];
+var ANIMAL_PAIR_LIST = ['bear-rabbit', 'cat-chick', 'panda-frog'];
+
+// v0.2: BGM(WebAudio合成)。効果音より明確に小さいゲイン
+var BGM_GAIN_BASE = 0.12;
 
 // spring-damper tuning: theta'' = k(target-theta) - c*theta'  (degrees)
 // zeta = c/(2*sqrt(k)) ~= 0.42 -> underdamped, ~1-2 visible oscillations then settle
@@ -71,6 +91,7 @@ var CORNER_ZONE = { x: 0, y: 0, w: 90, h: 90 };
 
 var MENU_PANEL = { x: 212, y: 170, w: 600, h: 420 };
 var MENU_RECTS = {
+  bgm: { x: 262, y: 360, w: 500, h: 56 },
   copy: { x: 262, y: 430, w: 220, h: 74 },
   clear: { x: 542, y: 430, w: 220, h: 74 },
   close: { x: 472, y: 526, w: 80, h: 56 }
@@ -98,6 +119,34 @@ var timescale = (isFinite(tsParam) && tsParam > 0) ? tsParam : 1;
 
 // ==== SECTION: audio ====
 var audioCtx = null, masterGain = null, creakOsc = null, creakFilter = null, creakGain = null;
+var bgmGain = null;
+
+// v0.2: BGM設定の永続化(tenbin_prefs)。旧データ・欠損は falsy安全に {bgm:true} を補う
+var PREFS_KEY = 'tenbin_prefs';
+function loadPrefs() {
+  try {
+    var raw = localStorage.getItem(PREFS_KEY);
+    if (!raw) return { bgm: true };
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { bgm: true };
+    return { bgm: parsed.bgm !== false };
+  } catch (e) { return { bgm: true }; }
+}
+var prefs = loadPrefs();
+var bgmEnabled = prefs.bgm;
+function persistPrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (e) {}
+}
+function setBgmEnabled(v) {
+  bgmEnabled = !!v;
+  prefs.bgm = bgmEnabled; // 操作の瞬間に確定・保存
+  persistPrefs();
+  if (audioCtx) {
+    if (bgmEnabled) startBgm(); else stopBgm();
+    applyBgmGain();
+  }
+}
+function toggleBgm() { setBgmEnabled(!bgmEnabled); }
 
 function ensureAudio() {
   if (audioCtx) {
@@ -111,7 +160,12 @@ function ensureAudio() {
     masterGain = audioCtx.createGain();
     masterGain.gain.value = 0.5;
     masterGain.connect(audioCtx.destination);
+    bgmGain = audioCtx.createGain();
+    bgmGain.gain.value = 0;
+    bgmGain.connect(masterGain);
     setupCreak();
+    if (bgmEnabled) startBgm();
+    applyBgmGain();
   } catch (e) {
     audioCtx = null;
   }
@@ -169,7 +223,7 @@ function playNoiseBurst(dur, vol, freq) {
     var bufSize = Math.max(1, Math.floor(audioCtx.sampleRate * dur));
     var buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
     var data = buf.getChannelData(0);
-    for (var i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+    for (var i = 0; i < bufSize; i++) data[i] = (audioNoiseRng() * 2 - 1) * (1 - i / bufSize);
     var src = audioCtx.createBufferSource();
     src.buffer = buf;
     var filt = audioCtx.createBiquadFilter();
@@ -195,6 +249,96 @@ function playFanfare(rainbow) {
   for (var i = 0; i < notes.length; i++) {
     playTone({ freq: notes[i], dur: 0.3, type: 'triangle', vol: 0.2, delay: i * 0.11 });
   }
+}
+
+// --- v0.2: BGM(ペンタトニックのアルペジオ + 低いパッド) ---
+// ゆらぎはゲームRNGと独立の固定シードRNGを使う(ゲームの配置再現性を壊さない)
+var bgmRng = mulberry32(0x5eed);
+// 効果音のノイズ源。ゲーム rng を消費すると配置の決定性が壊れるため専用 rng を使う
+var audioNoiseRng = mulberry32(0xA0D10);
+var BGM_TEMPO_BPM = 76;
+var BGM_NOTE_BEAT = 60 / BGM_TEMPO_BPM; // 1音の基本間隔(秒・実時間)
+var BGM_SCALE = [261.63, 293.66, 329.63, 392.00, 440.00]; // C4 D4 E4 G4 A4 ペンタトニック
+var BGM_PAD_NOTES = [130.81, 196.00]; // C3 + G3(5度)の低いパッド
+var bgmSchedulerId = null;
+var bgmNextNoteTime = 0;
+var padOsc1 = null, padOsc2 = null, padGain = null, padLfo = null, padLfoGain = null;
+
+function scheduleBgmNote(t0) {
+  try {
+    var freq = BGM_SCALE[Math.floor(bgmRng() * BGM_SCALE.length)];
+    var dur = BGM_NOTE_BEAT * (0.7 + bgmRng() * 0.5);
+    var osc = audioCtx.createOscillator();
+    osc.type = bgmRng() < 0.6 ? 'triangle' : 'sine';
+    osc.frequency.value = freq;
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(1, t0 + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g); g.connect(bgmGain);
+    osc.start(t0); osc.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+
+function bgmSchedulerTick() {
+  if (!audioCtx || !bgmGain) return;
+  var lookahead = 0.2; // 実時間ベースの先読みスケジューリング
+  while (bgmNextNoteTime < audioCtx.currentTime + lookahead) {
+    scheduleBgmNote(bgmNextNoteTime);
+    bgmNextNoteTime += BGM_NOTE_BEAT;
+  }
+}
+
+function startPad() {
+  try {
+    padOsc1 = audioCtx.createOscillator();
+    padOsc1.type = 'sine'; padOsc1.frequency.value = BGM_PAD_NOTES[0];
+    padOsc2 = audioCtx.createOscillator();
+    padOsc2.type = 'sine'; padOsc2.frequency.value = BGM_PAD_NOTES[1];
+    padGain = audioCtx.createGain();
+    padGain.gain.value = 0.5;
+    padOsc1.connect(padGain); padOsc2.connect(padGain);
+    padGain.connect(bgmGain);
+    padOsc1.start(); padOsc2.start();
+    // ゆっくりした音量のうねり(LFO)
+    padLfo = audioCtx.createOscillator();
+    padLfo.type = 'sine'; padLfo.frequency.value = 0.08;
+    padLfoGain = audioCtx.createGain();
+    padLfoGain.gain.value = 0.2;
+    padLfo.connect(padLfoGain);
+    padLfoGain.connect(padGain.gain);
+    padLfo.start();
+  } catch (e) {}
+}
+
+function stopPad() {
+  try { if (padOsc1) padOsc1.stop(); } catch (e) {}
+  try { if (padOsc2) padOsc2.stop(); } catch (e) {}
+  try { if (padLfo) padLfo.stop(); } catch (e) {}
+  padOsc1 = null; padOsc2 = null; padLfo = null; padLfoGain = null; padGain = null;
+}
+
+function startBgm() {
+  if (!audioCtx || bgmSchedulerId !== null) return;
+  bgmNextNoteTime = audioCtx.currentTime + 0.05;
+  bgmSchedulerId = setInterval(bgmSchedulerTick, 50);
+  startPad();
+}
+
+function stopBgm() {
+  if (bgmSchedulerId !== null) { clearInterval(bgmSchedulerId); bgmSchedulerId = null; }
+  stopPad();
+}
+
+// bgmGain の目標値を一元決定: 無効なら0、完了演出中は1/3にダッキング。
+// 毎ステップ状態から導出する（phase 遷移との呼び出し順に依存させない）
+var bgmGainAppliedTarget = null;
+function applyBgmGain() {
+  if (!audioCtx || !bgmGain) return;
+  var target = bgmEnabled ? (phase === 'celebrate' ? BGM_GAIN_BASE / 3 : BGM_GAIN_BASE) : 0;
+  if (target === bgmGainAppliedTarget) return;
+  bgmGainAppliedTarget = target;
+  try { bgmGain.gain.setTargetAtTime(target, audioCtx.currentTime, 0.25); } catch (e) {}
 }
 
 // ==== SECTION: entities ====
@@ -228,6 +372,10 @@ var particles = [];
 var problemLog = { startSimMs: 0, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
 var logStorage = loadLogs();
 var session = null;
+// v0.2: 無操作ヒント(ゴーストハンド)の基準時刻。問題開始とどこかのタップでリセットする
+var lastInteractionSimMs = 0;
+// v0.2: セッションのテーマ(果物・動物ペア)。startNewSession() のたびにゲームRNGで選び直す
+var theme = { fruit: FRUIT_LIST[0], animals: ANIMAL_PAIR_LIST[0] };
 
 function makeApple(x, y) {
   return {
@@ -235,7 +383,8 @@ function makeApple(x, y) {
     x: x, y: y, r: APPLE_R, state: 'field', plate: null,
     dragTargetX: x, dragTargetY: y, scale: 1,
     vx: 0, vy: 0, resting: false,
-    plateLocalX: 0, plateLocalY: 0
+    plateLocalX: 0, plateLocalY: 0,
+    moveHistory: null // v0.2: ドラッグ中の指の移動履歴(離した瞬間の初速計算に使用)
   };
 }
 
@@ -311,6 +460,7 @@ function startProblem(idx) {
   settleTimer = 0;
   celebrationType = null;
   problemLog = { startSimMs: simTimeMs, firstTouchSimMs: null, dropOutside: 0, removedFromPlate: 0 };
+  lastInteractionSimMs = simTimeMs; // 無操作ヒントの基準時刻もこの問題の開始瞬間に確定
   // 導出状態（皿座標）もこの瞬間に確定させる。最初の物理ステップまでの間に
   // 入力・読み取りが来ても未初期化値 (0,0) を晒さない
   computePlates();
@@ -330,7 +480,15 @@ function loadLogs() {
 function persistLogs() {
   try { localStorage.setItem('tenbin_logs', JSON.stringify(logStorage)); } catch (e) {}
 }
+function chooseTheme() {
+  // ゲームRNGから選択(同?seedなら決定的。「もう1回」で変わりうる)
+  theme = {
+    fruit: FRUIT_LIST[Math.floor(rng() * FRUIT_LIST.length)],
+    animals: ANIMAL_PAIR_LIST[Math.floor(rng() * ANIMAL_PAIR_LIST.length)]
+  };
+}
 function startNewSession() {
+  chooseTheme();
   session = { sessionStart: new Date().toISOString(), completed: false, retried: false, problems: [] };
   logStorage.push(session);
   persistLogs();
@@ -404,17 +562,41 @@ function snapToPlate(a, side) {
   playPlace();
 }
 
+// v0.2: 落下中、下向き(vy>0)に皿面の高さ帯を毎ステップ跨いだかを判定する。
+// 天秤が傾いて皿が動いていても、常に「今の」皿位置(plates.L/R、傾き反映後)で判定する
+function tryCatchByPlate(a, prevY) {
+  if (a.vy <= 0) return false;
+  var sides = ['L', 'R'];
+  for (var i = 0; i < sides.length; i++) {
+    var side = sides[i];
+    var p = plates[side];
+    if (Math.abs(a.x - p.x) > PLATE_CATCH_HALF_W) continue;
+    var surfaceY = p.y - PLATE_CATCH_BAND_OFFSET;
+    if (prevY < surfaceY && a.y >= surfaceY) {
+      snapToPlate(a, side);
+      return true;
+    }
+  }
+  return false;
+}
+
 function updateGroundApple(a, dt) {
   if (a.resting) return;
+  var prevY = a.y;
   a.vy += GRAVITY * dt;
   a.x += a.vx * dt;
   a.y += a.vy * dt;
+  if (tryCatchByPlate(a, prevY)) return; // 皿に捕捉された(state='plate' に遷移済み)
   if (a.x < APPLE_R + 10) { a.x = APPLE_R + 10; a.vx = -a.vx * 0.4; }
   if (a.x > LOGICAL_W - APPLE_R - 10) { a.x = LOGICAL_W - APPLE_R - 10; a.vx = -a.vx * 0.4; }
   if (a.y >= GROUND_Y) {
     a.y = GROUND_Y;
     if (Math.abs(a.vy) > 30) { a.vy = -a.vy * 0.35; a.vx *= 0.6; }
-    else { a.vy = 0; a.vx = 0; a.resting = true; }
+    else {
+      a.vy = 0; a.vx = 0; a.resting = true;
+      // dropOutside は「地面静止が確定した瞬間」に一度だけ数える(リリース瞬間ではない)
+      problemLog.dropOutside++;
+    }
   }
 }
 
@@ -441,6 +623,7 @@ function celebrateInit() {
     queueR: (celebrationType === 'balance' || celebrationType === 'right') ? plateOrder.R.slice() : [],
     finaleTimer: 0, finaleDone: false
   };
+  applyBgmGain(); // 完了演出中は物理音(答え)をマスクしないようBGMをダッキング
 }
 
 function eatApple(id, side) {
@@ -487,6 +670,7 @@ function updateCelebrate(dt) {
 function advanceAfterCelebration() {
   celebrate = null;
   celebrationType = null;
+  applyBgmGain(); // 演出終了でBGM音量を復帰
   if (problemIndex >= LEVELS.length - 1) {
     phase = 'sessionEnd';
   } else {
@@ -635,33 +819,69 @@ function startDragApple(a, x, y) {
   a.state = 'drag';
   a.dragTargetX = x; a.dragTargetY = y;
   a.scale = 1.15;
+  a.moveHistory = [{ t: simTimeMs, x: x, y: y }]; // v0.2: 初速計算用にドラッグ開始点から記録し直す
   playPluck();
   dragApple = a;
   if (problemLog.firstTouchSimMs === null) problemLog.firstTouchSimMs = simTimeMs;
 }
 
+// v0.2: ドラッグ中の指の移動履歴から離した瞬間の速度を推定する(直近数サンプルの平均的な傾き)
+var DRAG_HISTORY_MAX = 6;
+function recordDragHistory(a, x, y) {
+  if (!a.moveHistory) a.moveHistory = [];
+  a.moveHistory.push({ t: simTimeMs, x: x, y: y });
+  if (a.moveHistory.length > DRAG_HISTORY_MAX) a.moveHistory.shift();
+}
+function computeDragVelocity(a) {
+  var hist = a.moveHistory;
+  if (!hist || hist.length < 2) return { vx: 0, vy: 0 };
+  var first = hist[0], last = hist[hist.length - 1];
+  var dt = (last.t - first.t) / 1000;
+  if (dt <= 0.001) return { vx: 0, vy: 0 };
+  return { vx: (last.x - first.x) / dt, vy: (last.y - first.y) / dt };
+}
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// リリース位置が既に皿面帯に重なっている(=皿に重ねて放した)場合のみ即着地扱い。
+// 帯には下限がある——皿より下の空間・地面は皿ではない（動物に放す・地面の果物を
+// タップした操作が皿へワープしてはならない。世界律の一貫性）
+function findOverlappingPlateAtRelease(x, y) {
+  var sides = ['L', 'R'];
+  var best = null, bestD = Infinity;
+  for (var i = 0; i < sides.length; i++) {
+    var side = sides[i];
+    var p = plates[side];
+    var dx = Math.abs(x - p.x);
+    if (dx > PLATE_CATCH_HALF_W) continue;
+    if (y < p.y - PLATE_CATCH_BAND_OFFSET) continue; // まだ皿面より上 → 通常どおり落下させる
+    if (y > p.y + PLATE_CATCH_BELOW) continue;       // 皿より下 → 皿ではない。落下させる
+    if (dx < bestD) { bestD = dx; best = side; }
+  }
+  return best;
+}
+
+// v0.2: 統一落下物理。放したりんごは常に落下体になり、皿中心近くでの即スナップは行わない。
+// 皿に重ねて放した場合のみここで即着地、それ以外は ground 状態にして毎ステップ皿捕捉判定(tryCatchByPlate)に委ねる
 function releaseDragApple(x, y) {
   var a = dragApple;
   if (!a) return;
-  var dL = Math.hypot(x - plates.L.x, y - plates.L.y);
-  var dR = Math.hypot(x - plates.R.x, y - plates.R.y);
+  var v = computeDragVelocity(a);
   a.scale = 1;
-  if (dL <= PLATE_SNAP_R && dL <= dR) {
-    snapToPlate(a, 'L');
-  } else if (dR <= PLATE_SNAP_R) {
-    snapToPlate(a, 'R');
-  } else {
-    a.state = 'ground';
-    a.resting = false;
-    a.vx = (rng() * 2 - 1) * 60;
-    a.vy = -60;
-    problemLog.dropOutside++;
-  }
+  a.moveHistory = null;
   dragApple = null;
+  // 判定は果物の実位置（lerp 追従後）で行う。ポインタと実体の乖離で
+  // 「皿の上に見えるのにすり抜ける／皿外なのに載る」を作らない
+  var side = findOverlappingPlateAtRelease(a.x, a.y);
+  if (side) { snapToPlate(a, side); return; }
+  a.state = 'ground';
+  a.resting = false;
+  a.vx = clamp(v.vx * DRAG_RELEASE_VEL_SCALE, -DRAG_RELEASE_VEL_CAP, DRAG_RELEASE_VEL_CAP);
+  a.vy = clamp(v.vy * DRAG_RELEASE_VEL_SCALE, -DRAG_RELEASE_VEL_CAP, DRAG_RELEASE_VEL_CAP);
 }
 
 function menuPointerDown(x, y) {
   function hit(r) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  if (hit(MENU_RECTS.bgm)) { toggleBgm(); return; }
   if (hit(MENU_RECTS.copy)) { copyLogsToClipboard(); return; }
   if (hit(MENU_RECTS.clear)) { clearLogs(); return; }
   if (hit(MENU_RECTS.close)) { menuOpen = false; return; }
@@ -672,6 +892,7 @@ function menuPointerDown(x, y) {
 
 function handlePointerDown(x, y) {
   ensureAudio();
+  lastInteractionSimMs = simTimeMs; // v0.2: どこをタップしても無操作ヒントのタイマーは即リセット
   if (menuOpen) { menuPointerDown(x, y); return; }
   if (orientationBlocked) return;
   // 隅の長押しはりんごより優先（判定円の重なりで作用先が曖昧にならないように）。
@@ -684,7 +905,11 @@ function handlePointerDown(x, y) {
   if (a) { startDragApple(a, x, y); }
 }
 function handlePointerMove(x, y) {
-  if (dragApple) { dragApple.dragTargetX = x; dragApple.dragTargetY = y; return; }
+  if (dragApple) {
+    dragApple.dragTargetX = x; dragApple.dragTargetY = y;
+    recordDragHistory(dragApple, x, y);
+    return;
+  }
   if (longPress && longPress.active) {
     if (Math.hypot(x - longPress.x, y - longPress.y) > 24) longPress.active = false;
   }
@@ -692,6 +917,18 @@ function handlePointerMove(x, y) {
 function handlePointerUp(x, y) {
   if (dragApple) { releaseDragApple(x, y); }
   longPress = null;
+}
+
+// v0.2: 無操作ヒント(ゴーストハンド)。純粋にsimTimeMsから導出する値で、
+// 別に進行するタイマー状態を持たない(遅延実行の前提再検証を毎回自動で行う形にする)
+function firstFieldApple() {
+  for (var i = 0; i < apples.length; i++) if (apples[i].state === 'field') return apples[i];
+  return null;
+}
+function isHintActive() {
+  return phase === 'play' && !menuOpen && !orientationBlocked &&
+    problemLog.firstTouchSimMs === null &&
+    (simTimeMs - lastInteractionSimMs) >= HINT_DELAY_MS;
 }
 
 function bindInput() {
@@ -718,9 +955,10 @@ function bindInput() {
     for (var i = 0; i < e.changedTouches.length; i++) {
       var t = e.changedTouches[i];
       if (t.identifier === activePointerId) {
+        // 先に解放してからハンドラを呼ぶ（ハンドラ例外で入力が永久ロックしない）
+        activePointerId = null;
         var p = logicalFromClient(t.clientX, t.clientY);
         handlePointerUp(p.x, p.y);
-        activePointerId = null;
       }
     }
   }
@@ -740,9 +978,9 @@ function bindInput() {
   });
   window.addEventListener('mouseup', function (e) {
     if (activePointerId !== 'mouse') return;
+    activePointerId = null; // 先に解放（ハンドラ例外で入力が永久ロックしない）
     var p = logicalFromClient(e.clientX, e.clientY);
     handlePointerUp(p.x, p.y);
-    activePointerId = null;
   });
   canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 }
@@ -822,6 +1060,7 @@ function drawMenu(c) {
   c.fillText('完走率: ' + Math.round(stats.completeRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 120);
   c.fillText('もう1回率: ' + Math.round(stats.retryRate * 100) + '%', MENU_PANEL.x + 30, MENU_PANEL.y + 150);
 
+  drawMenuButton(c, MENU_RECTS.bgm, 'おんがく: ' + (bgmEnabled ? 'オン' : 'オフ'));
   drawMenuButton(c, MENU_RECTS.copy, menuFlash.copy > 0 ? 'コピーしました' : 'ログをコピー');
   drawMenuButton(c, MENU_RECTS.clear, menuFlash.clear > 0 ? '消去しました' : 'ログを消去');
   drawMenuButton(c, MENU_RECTS.close, '閉じる');
@@ -845,6 +1084,41 @@ function drawMenuButton(c, r, label) {
 }
 
 // ==== SECTION: render ====
+// v0.2: 無操作ヒント(ゴーストハンド)。文字は使わず「場の最初のりんご→近い方の皿」へ
+// easeInOutで動く半透明の手をループ表示する。描画のみ・ゲーム状態は一切変えない
+function easeInOutQuad(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+
+function drawHintHand(c) {
+  if (!isHintActive()) return;
+  var apple = firstFieldApple();
+  if (!apple) return;
+  var dL = Math.hypot(apple.x - plates.L.x, apple.y - plates.L.y);
+  var dR = Math.hypot(apple.x - plates.R.x, apple.y - plates.R.y);
+  var target = dL <= dR ? plates.L : plates.R;
+  var elapsed = simTimeMs - lastInteractionSimMs - HINT_DELAY_MS;
+  var cyclePos = elapsed % HINT_CYCLE_MS;
+  if (cyclePos < 0) cyclePos += HINT_CYCLE_MS;
+  var p = cyclePos / HINT_CYCLE_MS;
+  var move = easeInOutQuad(p);
+  var hx = apple.x + (target.x - apple.x) * move;
+  var hy = apple.y + (target.y - apple.y) * move;
+  var alpha = Math.max(0, Math.sin(p * Math.PI)) * 0.5; // 0.4〜0.55程度でフェードイン・アウト
+  if (alpha <= 0.01) return;
+  c.save();
+  c.globalAlpha = alpha;
+  c.fillStyle = '#3a3a3a';
+  c.beginPath();
+  c.ellipse(hx, hy, 30, 24, 0, 0, Math.PI * 2);
+  c.fill();
+  var fingerOffsets = [-16, -6, 6, 16];
+  for (var i = 0; i < fingerOffsets.length; i++) {
+    c.beginPath();
+    c.ellipse(hx + fingerOffsets[i], hy - 22, 7, 12, 0, 0, Math.PI * 2);
+    c.fill();
+  }
+  c.restore();
+}
+
 function roundRect(c, x, y, w, h, r) {
   c.beginPath();
   c.moveTo(x + r, y);
@@ -897,45 +1171,73 @@ function drawProgressDots(c) {
   }
 }
 
-function drawAppleShape(c, x, y, r, scale) {
+// v0.2: 果物3種(りんご/みかん/もも)。現セッションのテーマ(theme.fruit)で見た目を切り替える
+var FRUIT_STYLES = {
+  apple: { hi: '#ff8a7a', lo: '#e0392b', stroke: 'rgba(150,30,20,0.4)' },
+  orange: { hi: '#ffc36b', lo: '#f08a1c', stroke: 'rgba(150,80,10,0.4)' },
+  peach: { hi: '#ffd7e0', lo: '#f4909f', stroke: 'rgba(170,60,80,0.4)' }
+};
+
+function drawFruitShape(c, x, y, r, scale) {
   c.save();
   c.translate(x, y);
   c.scale(scale, scale);
+  var style = FRUIT_STYLES[theme.fruit] || FRUIT_STYLES.apple;
   var g = c.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.2, 0, 0, r);
-  g.addColorStop(0, '#ff8a7a');
-  g.addColorStop(1, '#e0392b');
+  g.addColorStop(0, style.hi);
+  g.addColorStop(1, style.lo);
   c.beginPath();
   c.arc(0, 2, r, 0, Math.PI * 2);
   c.fillStyle = g;
   c.fill();
-  c.strokeStyle = 'rgba(150,30,20,0.4)';
+  c.strokeStyle = style.stroke;
   c.lineWidth = 1.5;
   c.stroke();
-  c.fillStyle = '#7a4a25';
-  c.fillRect(-2, -r - 4, 4, 8);
-  c.beginPath();
-  c.ellipse(6, -r - 2, 6, 3.2, -0.5, 0, Math.PI * 2);
-  c.fillStyle = '#5faa4e';
-  c.fill();
+  if (theme.fruit === 'orange') {
+    c.fillStyle = '#6b8f3a';
+    c.beginPath(); c.arc(0, -r + 2, 3, 0, Math.PI * 2); c.fill();
+    c.fillStyle = 'rgba(150,90,20,0.35)';
+    for (var i = 0; i < 5; i++) {
+      var ang = (i / 5) * Math.PI * 2;
+      c.beginPath(); c.arc(Math.cos(ang) * r * 0.5, 2 + Math.sin(ang) * r * 0.5, 1.6, 0, Math.PI * 2); c.fill();
+    }
+  } else if (theme.fruit === 'peach') {
+    c.strokeStyle = 'rgba(190,90,90,0.5)';
+    c.lineWidth = 2;
+    c.beginPath();
+    c.moveTo(0, 2 - r * 0.85);
+    c.quadraticCurveTo(3, 2, 0, 2 + r * 0.85);
+    c.stroke();
+    c.fillStyle = '#7a9a4a';
+    c.beginPath(); c.ellipse(2, -r - 1, 5, 2.6, -0.3, 0, Math.PI * 2); c.fill();
+  } else {
+    // apple (既定): 茎+葉
+    c.fillStyle = '#7a4a25';
+    c.fillRect(-2, -r - 4, 4, 8);
+    c.beginPath();
+    c.ellipse(6, -r - 2, 6, 3.2, -0.5, 0, Math.PI * 2);
+    c.fillStyle = '#5faa4e';
+    c.fill();
+  }
   c.restore();
 }
 
 function drawFieldApples(c) {
   for (var i = 0; i < apples.length; i++) {
     var a = apples[i];
-    if (a.state === 'field' || a.state === 'ground') drawAppleShape(c, a.x, a.y, a.r, a.scale);
+    if (a.state === 'field' || a.state === 'ground') drawFruitShape(c, a.x, a.y, a.r, a.scale);
   }
 }
 
 function drawDragApple(c) {
   if (!dragApple) return;
-  drawAppleShape(c, dragApple.x, dragApple.y, dragApple.r, dragApple.scale);
+  drawFruitShape(c, dragApple.x, dragApple.y, dragApple.r, dragApple.scale);
 }
 
 function drawPlateApples(c, side) {
   for (var i = 0; i < apples.length; i++) {
     var a = apples[i];
-    if (a.state === 'plate' && a.plate === side) drawAppleShape(c, a.x, a.y, a.r, a.scale);
+    if (a.state === 'plate' && a.plate === side) drawFruitShape(c, a.x, a.y, a.r, a.scale);
   }
 }
 
@@ -979,7 +1281,7 @@ function drawBeamAndPlates(c) {
 
 function drawPlateDish(c, x, y) {
   c.beginPath();
-  c.ellipse(x, y, 78, 22, 0, 0, Math.PI * 2);
+  c.ellipse(x, y, PLATE_DISH_RX, PLATE_DISH_RY, 0, 0, Math.PI * 2);
   c.fillStyle = '#dfe7ee';
   c.fill();
   c.strokeStyle = '#aab5c2';
@@ -1032,9 +1334,98 @@ function drawRabbit(c, x, y, bounce) {
   c.restore();
 }
 
+// v0.2: 動物ペア(クマ&ウサギ/ネコ&ヒヨコ/パンダ&カエル)。跳ねる・食べるアニメは共通(bounce引数)
+function drawCat(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#9aa0a8';
+  c.beginPath(); c.arc(0, -18, 46, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -78, 30, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.moveTo(-26, -98); c.lineTo(-10, -118); c.lineTo(-4, -92); c.closePath(); c.fill();
+  c.beginPath(); c.moveTo(26, -98); c.lineTo(10, -118); c.lineTo(4, -92); c.closePath(); c.fill();
+  c.fillStyle = '#f2f0ee';
+  c.beginPath(); c.arc(0, -70, 14, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#2c2015';
+  c.beginPath(); c.arc(-9, -80, 3, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(9, -80, 3, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#e08a8a';
+  c.beginPath(); c.arc(0, -66, 3, 0, Math.PI * 2); c.fill();
+  c.strokeStyle = 'rgba(60,60,60,0.6)'; c.lineWidth = 1.5;
+  c.beginPath(); c.moveTo(-6, -66); c.lineTo(-34, -70); c.moveTo(-6, -62); c.lineTo(-34, -58); c.stroke();
+  c.beginPath(); c.moveTo(6, -66); c.lineTo(34, -70); c.moveTo(6, -62); c.lineTo(34, -58); c.stroke();
+  c.restore();
+}
+
+function drawChick(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#ffd94a';
+  c.beginPath(); c.arc(0, -18, 38, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -68, 26, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#f6a623';
+  c.beginPath(); c.moveTo(-8, -64); c.lineTo(8, -64); c.lineTo(0, -54); c.closePath(); c.fill();
+  c.fillStyle = '#2c2015';
+  c.beginPath(); c.arc(-9, -72, 3, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(9, -72, 3, 0, Math.PI * 2); c.fill();
+  c.restore();
+}
+
+function drawPanda(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#fbfbfb';
+  c.beginPath(); c.arc(0, -18, 46, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -78, 32, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#2a2a2a';
+  c.beginPath(); c.arc(-24, -104, 12, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(24, -104, 12, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.ellipse(-12, -80, 9, 12, -0.2, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.ellipse(12, -80, 9, 12, 0.2, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#fff';
+  c.beginPath(); c.arc(-12, -80, 4, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(12, -80, 4, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#111';
+  c.beginPath(); c.arc(-12, -79, 2, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(12, -79, 2, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -66, 4, 0, Math.PI * 2); c.fill();
+  c.restore();
+}
+
+function drawFrog(c, x, y, bounce) {
+  var jump = -Math.sin(Math.min(1, bounce / 320) * Math.PI) * 26;
+  var yy = y + jump;
+  c.save();
+  c.translate(x, yy);
+  c.fillStyle = '#6cbf5a';
+  c.beginPath(); c.arc(0, -14, 44, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(0, -54, 30, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#eaffe0';
+  c.beginPath(); c.arc(-18, -80, 13, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(18, -80, 13, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#1c2b12';
+  c.beginPath(); c.arc(-18, -80, 5, 0, Math.PI * 2); c.fill();
+  c.beginPath(); c.arc(18, -80, 5, 0, Math.PI * 2); c.fill();
+  c.strokeStyle = '#3a6b2c'; c.lineWidth = 2.5;
+  c.beginPath(); c.moveTo(-16, -46); c.quadraticCurveTo(0, -38, 16, -46); c.stroke();
+  c.restore();
+}
+
+var ANIMAL_DRAWERS = {
+  'bear-rabbit': { left: drawBear, right: drawRabbit },
+  'cat-chick': { left: drawCat, right: drawChick },
+  'panda-frog': { left: drawPanda, right: drawFrog }
+};
+
 function drawAnimals(c) {
-  drawBear(c, BEAR_POS.x, BEAR_POS.y, animalBounce.L);
-  drawRabbit(c, RABBIT_POS.x, RABBIT_POS.y, animalBounce.R);
+  var pair = ANIMAL_DRAWERS[theme.animals] || ANIMAL_DRAWERS['bear-rabbit'];
+  pair.left(c, BEAR_POS.x, BEAR_POS.y, animalBounce.L);
+  pair.right(c, RABBIT_POS.x, RABBIT_POS.y, animalBounce.R);
 }
 
 function drawParticles(c) {
@@ -1077,8 +1468,9 @@ function drawSessionEnd(c) {
     drawStarPath(c, 26);
     c.restore();
   }
-  drawBear(c, BEAR_POS.x, BEAR_POS.y, 320 * (0.5 + Math.sin(simTimeMs / 260) * 0.5));
-  drawRabbit(c, RABBIT_POS.x, RABBIT_POS.y, 320 * (0.5 + Math.cos(simTimeMs / 260) * 0.5));
+  var pair = ANIMAL_DRAWERS[theme.animals] || ANIMAL_DRAWERS['bear-rabbit'];
+  pair.left(c, BEAR_POS.x, BEAR_POS.y, 320 * (0.5 + Math.sin(simTimeMs / 260) * 0.5));
+  pair.right(c, RABBIT_POS.x, RABBIT_POS.y, 320 * (0.5 + Math.cos(simTimeMs / 260) * 0.5));
   c.restore();
 }
 
@@ -1145,6 +1537,7 @@ function render() {
     drawBeamAndPlates(ctx);
     drawAnimals(ctx);
     drawDragApple(ctx);
+    drawHintHand(ctx);
     drawParticles(ctx);
     if (phase === 'sessionEnd') drawSessionEnd(ctx);
     if (phase === 'transition' && transitionState) drawTransitionFade(ctx);
@@ -1160,6 +1553,7 @@ function updateOrientation() {
 
 function step(dt) {
   simTimeMs += dt * 1000;
+  applyBgmGain(); // 状態から毎ステップ導出（phase 遷移との順序に依存させない）
   updateOrientation();
   if (orientationBlocked) { updateCreak(0); return; }
   updateLongPress(dt);
@@ -1230,12 +1624,16 @@ function installTenbinHook() {
       enumerable: true, get: function () {
         if (!menuOpen) return null;
         return {
+          bgm: { x: MENU_RECTS.bgm.x, y: MENU_RECTS.bgm.y, w: MENU_RECTS.bgm.w, h: MENU_RECTS.bgm.h },
           copy: { x: MENU_RECTS.copy.x, y: MENU_RECTS.copy.y, w: MENU_RECTS.copy.w, h: MENU_RECTS.copy.h },
           clear: { x: MENU_RECTS.clear.x, y: MENU_RECTS.clear.y, w: MENU_RECTS.clear.w, h: MENU_RECTS.clear.h },
           close: { x: MENU_RECTS.close.x, y: MENU_RECTS.close.y, w: MENU_RECTS.close.w, h: MENU_RECTS.close.h }
         };
       }
     },
+    theme: { enumerable: true, get: function () { return { fruit: theme.fruit, animals: theme.animals }; } },
+    bgmEnabled: { enumerable: true, get: function () { return bgmEnabled; } },
+    hintActive: { enumerable: true, get: function () { return isHintActive(); } },
     celebrationType: { enumerable: true, get: function () { return celebrationType; } },
     session: { enumerable: true, get: function () { return session; } },
     problemLog: {
