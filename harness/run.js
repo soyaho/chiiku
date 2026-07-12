@@ -57,7 +57,7 @@ async function snap() {
     return {
       screen: t.screen, game: t.game, menuTiles: t.menuTiles, homeButton: t.homeButton,
       phase: t.phase, round: t.round, apples: t.apples, plates: t.plates, mouths: t.mouths,
-      balance: t.balance, counts: t.counts, boat: t.boat,
+      balance: t.balance, counts: t.counts, weights: t.weights, boat: t.boat,
       orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
       session: t.session, theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
@@ -144,15 +144,17 @@ async function placeOne(apple, plateKey) {
     throw new Error(`${e.message} | phase=${s.phase} counts=${s.counts.left}/${s.counts.right} apples=${JSON.stringify(states)}`);
   }
 }
-// 果物1個を動物に食べさせる（fed カウントが増えるまで待つ）
+// 果物1個を動物に食べさせる（カウンタが増えるまで待つ。てんびん=fedL/fedR、おふね=directFeeds）
 async function feedOne(apple, side) {
   const before = await snap();
-  const fedBefore = before.round[side === 'L' ? 'fedL' : 'fedR'];
+  const isOfune = before.game === 'ofune';
+  const fedOf = s => (isOfune ? s.round.directFeeds : s.round[side === 'L' ? 'fedL' : 'fedR']);
+  const fedBefore = fedOf(before);
   const fresh = before.apples.find(a => a.id === apple.id) || apple;
   await drag({ x: fresh.x, y: fresh.y }, { x: before.mouths[side].x, y: before.mouths[side].y });
   await waitFor(async () => {
     const s = await snap();
-    return s.round && s.round[side === 'L' ? 'fedL' : 'fedR'] > fedBefore;
+    return s.round && fedOf(s) > fedBefore;
   }, `fruit ${apple.id} eaten by animal ${side}`, 15_000);
 }
 // 現在のラウンドを完了させる。assign(apple, s) → 'L' | 'R' | 'feedL' | 'feedR'
@@ -363,10 +365,11 @@ function serve() {
 
   await test('geometry invariant: mouth zones never overlap plate catch bands', async () => {
     const s = await snap();
-    const fruitR = s.apples[0].r;
-    const lOk = s.mouths.L.x + s.mouths.L.r + fruitR <= s.plates.L.x - s.plates.catchHalfW;
-    const rOk = s.mouths.R.x - s.mouths.R.r - fruitR >= s.plates.R.x + s.plates.catchHalfW;
-    assert(lOk && rOk, `non-overlap: mouthL=${JSON.stringify(s.mouths.L)} plateL=${JSON.stringify(s.plates.L)} halfW=${s.plates.catchHalfW} → L=${lOk} R=${rOk}`);
+    // v0.7: 口の捕捉は果物の実半径ぶん外側まで届くため、最大半径（おおもの=1.5倍）で検証する
+    const bigR = Math.round(s.apples[0].r * 1.5);
+    const lOk = s.mouths.L.x + s.mouths.L.r + bigR <= s.plates.L.x - s.plates.catchHalfW;
+    const rOk = s.mouths.R.x - s.mouths.R.r - bigR >= s.plates.R.x + s.plates.catchHalfW;
+    assert(lOk && rOk, `non-overlap (big-fruit margin): mouthL=${JSON.stringify(s.mouths.L)} plateL=${JSON.stringify(s.plates.L)} halfW=${s.plates.catchHalfW} → L=${lOk} R=${rOk}`);
   });
 
   await test('idle hint: ghost hand appears after 5s idle, hides on touch', async () => {
@@ -1242,6 +1245,148 @@ function serve() {
     let maxUp = 0;
     for (let i = 1; i < series.length; i++) maxUp = Math.max(maxUp, series[i - 1] - series[i]);
     assert(maxUp <= 50, `no upward teleport while landing, max upward step ${maxUp.toFixed(1)}px (n=${series.length})`);
+  });
+
+  // ===== v0.7 フィードバック対応 =====
+
+  // 「高さの上限みたいなのがある」の正体: 止めて狙ってから放しても古いスワイプ速度で
+  // 射出され、高い位置ほど滞空中に横へ流されて甲板を外れ水没していた（診断スクリプトで
+  // holdY=400 → 水没を確認済み）。修正後: 手を止めてから放せばまっすぐ落ちて載る
+  await test('ofune: aim-and-release from high above deck loads (no stale-velocity launch)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=11&timescale=2&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const s = await snap();
+    const f = await findOfuneFruit();
+    assert(f, 'free fruit available');
+    const from = await toClient(f.x, f.y);
+    const hold = await toClient(s.boat.x, 300); // 甲板(≈550)の 250px 上空
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, 60));
+    for (let i = 1; i <= 8; i++) {
+      await page.mouse.move(from.x + (hold.x - from.x) * i / 8, from.y + (hold.y - from.y) * i / 8);
+      await new Promise(r => setTimeout(r, 16));
+    }
+    await new Promise(r => setTimeout(r, 300)); // 手を止めて狙う（履歴は更新されない）
+    const splashesBefore = (await snap()).round.splashes;
+    await page.mouse.up();
+    await waitFor(async () => {
+      const st = await snap();
+      const a = st.apples.find(x => x.id === f.id);
+      return a.state === 'boat' ? a : null;
+    }, 'fruit drops straight down onto the deck', 10_000);
+    assert((await snap()).round.splashes === splashesBefore, 'no splash: fruit did not drift into water');
+  });
+
+  // おおもの（重さ2）: 出現曲線（0,1ラウンド=なし → 2ラウンド目=1個確定）と
+  // 「個数ではなく重さに世界が応答する」第二の発見を検証
+  await test('tenbin: big fruit — spawn curve, tilt by weight, balance on equal weight', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    let s = await waitForRound(0);
+    assert(s.apples.every(a => (a.weight || 1) === 1), 'round 0 has no big fruit');
+    await completeRound(a => (a.x < 512 ? 'feedL' : 'feedR'));
+    s = await waitForRound(1);
+    assert(s.apples.every(a => (a.weight || 1) === 1), 'round 1 has no big fruit');
+    await completeRound(a => (a.x < 512 ? 'feedL' : 'feedR'));
+    s = await waitForRound(2);
+    const bigs = s.apples.filter(a => a.weight === 2);
+    assert(bigs.length === 1, `round 2 has exactly one big fruit, got ${bigs.length}`);
+    assert(s.round.bigFruits === 1, `round.bigFruits === 1, got ${s.round.bigFruits}`);
+    // おおもの1個(左) vs 通常1個(右): 個数は同数でも重い側に傾く
+    await placeOne(bigs[0], 'L');
+    const n1 = await findFreeFruit();
+    assert(n1, 'a normal fruit remains');
+    await placeOne(n1, 'R');
+    await waitFor(async () => {
+      const st = await snap();
+      return st.weights && st.weights.left === 2 && st.weights.right === 1 && st.balance.target < 0;
+    }, 'tilts to the heavier side despite equal counts (weights 2 vs 1)', 10_000);
+    // 通常をもう1個右へ → 重さ 2=2 で釣り合い祝福（個数は 1 vs 2）
+    const before = (await snap()).round.balanceCelebrations;
+    const n2 = await findFreeFruit();
+    assert(n2, 'another normal fruit remains');
+    await placeOne(n2, 'R');
+    await waitFor(async () => {
+      const st = await snap();
+      return st.round && st.round.balanceCelebrations > before;
+    }, 'balance celebration on equal WEIGHT (1 big vs 2 normal)', 20_000);
+    // 監査v0.7-所見2: おおものは縁が動物に触れていれば食べてもらえる（口カプセルの実半径対応）
+    let st = await snap();
+    const melon = st.apples.find(a => a.weight === 2);
+    assert(melon && melon.state === 'plate', 'melon still on plate');
+    const fedBefore = st.round.fedL;
+    const flankX = st.mouths.L.x + st.mouths.L.r + 33; // 旧判定(+26)の外・新判定(+r=39)の内
+    await drag({ x: melon.x, y: melon.y }, { x: flankX, y: 650 });
+    await waitFor(async () => {
+      const s2 = await snap();
+      return s2.round && s2.round.fedL > fedBefore;
+    }, 'big fruit edge-touching the animal is eaten (no refusal band)', 15_000);
+    // 監査v0.7-所見1/3: 出現配置の invariant——タッチ円(実r)が HOME と重ならない・果物同士がめり込まない
+    st = await snap();
+    for (const a of st.apples.filter(x => x.state === 'field')) {
+      const touchR = 62 + (a.r - 26);
+      const dx = Math.max(0, st.homeButton.x - a.x, a.x - (st.homeButton.x + st.homeButton.w));
+      const dy = Math.max(0, st.homeButton.y - a.y, a.y - (st.homeButton.y + st.homeButton.h));
+      assert(Math.hypot(dx, dy) >= touchR - 0.5, `fruit ${a.id} touch circle clear of home zone (d=${Math.hypot(dx, dy).toFixed(1)}, touchR=${touchR})`);
+    }
+  });
+
+  await test('ofune: big fruit — occupies 2 capacity, overflow math, bigFruits logged', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    let s = await waitForRound(0);
+    assert(s.apples.every(a => (a.weight || 1) === 1), 'round 0 has no big fruit');
+    await completeRound(() => 'feedL');
+    s = await waitForRound(1);
+    assert(s.apples.every(a => (a.weight || 1) === 1), 'round 1 has no big fruit');
+    await completeRound(() => 'feedR');
+    s = await waitForRound(2);
+    const bigs = s.apples.filter(a => a.weight === 2);
+    assert(bigs.length === 1, `round 2 has exactly one big fruit, got ${bigs.length}`);
+    // おおものは容量2ぶん。監査v0.7-所見2: 縁が船体に触れる位置（中心+110px）で放しても載る
+    const loadBefore = s.boat.load;
+    const splashesB4 = s.round.splashes;
+    {
+      const fresh = (await snap()).apples.find(a => a.id === bigs[0].id);
+      const b = (await snap()).boat;
+      await drag({ x: fresh.x, y: fresh.y }, { x: b.x + 110, y: b.y - b.h - 4 });
+    }
+    let st = await waitFor(async () => {
+      const s2 = await snap();
+      return s2.boat.load === loadBefore + 2 ? s2 : null;
+    }, 'edge-held big fruit loads and adds 2 to load', 15_000);
+    assert(st.round.splashes === splashesB4, 'no splash: big fruit did not graze off the hull');
+    // 容量ちょうどまで埋めて、さらに1個 → あふれ（load は容量を1瞬も超えない）
+    for (;;) {
+      st = await snap();
+      if (st.boat.load >= st.boat.capacity) break;
+      const f = await findOfuneFruit();
+      if (!f) break;
+      await loadOne(f);
+    }
+    st = await snap();
+    assert(st.boat.load === st.boat.capacity, `boat filled exactly to capacity, got ${st.boat.load}/${st.boat.capacity}`);
+    const extra = await findOfuneFruit();
+    if (extra) {
+      const ovBefore = st.round.overflowEvents;
+      await loadOne(extra);
+      const st2 = await snap();
+      assert(st2.boat.load <= st2.boat.capacity, 'load never exceeds capacity');
+      assert(st2.round.overflowEvents > ovBefore, 'extra fruit overflows back to water');
+    }
+    checkConservation(await snap());
+    // おうちで離脱 → bigFruits がラウンドレコードに数値で残る
+    st = await snap();
+    await pressHold({ x: st.homeButton.x + st.homeButton.w / 2, y: st.homeButton.y + st.homeButton.h / 2 },
+      Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 10_000);
+    const logs = await readLogs('ofune_logs');
+    const sess = logs[logs.length - 1];
+    const lastRound = sess.rounds[sess.rounds.length - 1];
+    assert(lastRound && typeof lastRound.bigFruits === 'number' && lastRound.bigFruits === 1,
+      `bigFruits recorded as number 1, got ${JSON.stringify(lastRound && lastRound.bigFruits)}`);
   });
 
   await test('no text during gameplay (guard) & no page errors', async () => {

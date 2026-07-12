@@ -51,6 +51,10 @@ var APPLE_R = 26;
 var APPLE_TOUCH_R = 62;
 var PLATE_CATCH_BELOW = PLATE_DISH_RY + APPLE_R + 14; // 即着地帯の下限（皿の厚み＋果物半径＋余白）
 var GROUND_Y = 700;
+// v0.7: おおもの(重さ2の大きい果物)。「個数≠重さ」という第二の数量現象を段階投入する。
+// 見た目はAPPLE_Rの1.5倍(丸め)。タッチ・支え計算は実半径(a.r)ベースにするため定数はサイズのみ
+var BIG_FRUIT_WEIGHT = 2;
+var BIG_APPLE_R = Math.round(APPLE_R * 1.5);
 var GRAVITY = 1000;
 var FOLLOW_RATE = -Math.log(1 - 0.4) * 60; // per-second lerp rate equivalent to 0.4/frame@60fps
 
@@ -439,6 +443,7 @@ var plateOrder = { L: [], R: [] };
 var plates = { L: { x: 0, y: 0 }, R: { x: 0, y: 0 } };
 var balance = { angle: 0, vel: 0, target: 0 };
 var counts = { left: 0, right: 0 };
+var weights = { left: 0, right: 0 }; // v0.7: 皿の重さ合計(個数=countsとは別に維持。傾きはこちらで決まる)
 var orientationBlocked = false;
 var menuOpen = false;
 var celebrationType = null;
@@ -493,7 +498,7 @@ var theme = { fruit: FRUIT_LIST[0], animals: ANIMAL_PAIR_LIST[0] };
 function makeApple(x, y) {
   return {
     id: nextAppleId++,
-    x: x, y: y, r: APPLE_R, state: 'field', plate: null,
+    x: x, y: y, r: APPLE_R, weight: 1, state: 'field', plate: null,
     dragTargetX: x, dragTargetY: y, scale: 1,
     vx: 0, vy: 0, resting: false,
     plateLocalX: 0, plateLocalY: 0,
@@ -561,6 +566,70 @@ function pickFruitsTotal() {
   return ROUND_FRUITS_MIN + Math.floor(rng() * (ROUND_FRUITS_MAX - ROUND_FRUITS_MIN + 1));
 }
 
+// v0.7: おおもの(重さ2)の出現数(両ゲーム共通の曲線。totalRoundIndexはこのラウンドの番号を
+// まだインクリメントする前に読む——newRoundState/newOfuneRoundStateがidxを確定させる直前の値)。
+// ラウンド0〜1=0個(基本律の学習曲線を守る)・ラウンド2=ちょうど1個確定(初サイクルで発見を保証)・
+// ラウンド3以降=0〜min(2,floor(総数/3))個(漸増感。シードrng経由で決定的)
+function pickBigFruitCount(fruitsTotal) {
+  if (totalRoundIndex <= 1) return 0;
+  if (totalRoundIndex === 2) return 1;
+  var maxCount = Math.min(2, Math.floor(fruitsTotal / 3));
+  if (maxCount <= 0) return 0;
+  return Math.floor(rng() * (maxCount + 1));
+}
+// 通常の果物のうち何個かを「置き換える」形でおおものにする(総数は変えない)。
+// 選ぶ果物はシードrng経由のフィッシャー-イェーツ抽出(決定的)。戻り値=実際に適用した個数
+function applyBigFruits(list) {
+  var count = pickBigFruitCount(list.length);
+  if (count <= 0) return 0;
+  var pool = [];
+  for (var i = 0; i < list.length; i++) pool.push(i);
+  var applied = 0;
+  for (var k = 0; k < count && pool.length > 0; k++) {
+    var pick = Math.floor(rng() * pool.length);
+    var idx = pool.splice(pick, 1)[0];
+    list[idx].weight = BIG_FRUIT_WEIGHT;
+    list[idx].r = BIG_APPLE_R;
+    applied++;
+  }
+  return applied;
+}
+// v0.7.1(監査所見1/3): おおもの適用後に実半径で再リラックスする。
+// layoutZone/relaxPoints は通常半径で整えるため、置き換え後のおおもの同士が最大20px
+// めり込みうる。あわせてタッチ円(実r基準)が HOME_ZONE と重ならないことも構造で保証する
+// (台帳#13の対策を r 可変に一般化——従来は座標の偶然で1px回避していた)
+function relaxApplesForRadius(list, zone) {
+  for (var iter = 0; iter < 8; iter++) {
+    for (var i = 0; i < list.length; i++) {
+      for (var j = i + 1; j < list.length; j++) {
+        var dx = list[j].x - list[i].x, dy = list[j].y - list[i].y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 0.001) { d = 0.001; dx = 0.001; dy = 0; }
+        var minDist = list[i].r + list[j].r + 6;
+        if (d < minDist) {
+          var push = (minDist - d) / 2;
+          var nx = dx / d, ny = dy / d;
+          list[i].x -= nx * push; list[i].y -= ny * push;
+          list[j].x += nx * push; list[j].y += ny * push;
+        }
+      }
+    }
+    for (var k = 0; k < list.length; k++) {
+      var a = list[k];
+      var touchR = APPLE_TOUCH_R + (a.r - APPLE_R);
+      var maxX = Math.min(zone.x + zone.w - a.r, HOME_ZONE.x - touchR);
+      a.x = Math.min(maxX, Math.max(zone.x + a.r, a.x));
+      a.y = Math.min(zone.y + zone.h - a.r, Math.max(zone.y + a.r, a.y));
+    }
+  }
+}
+function relaxTenbinZonesForRadius() {
+  var left = [], right = [];
+  for (var i = 0; i < apples.length; i++) (apples[i].x < 512 ? left : right).push(apples[i]);
+  relaxApplesForRadius(left, LEFT_ZONE);
+  relaxApplesForRadius(right, RIGHT_ZONE);
+}
+
 // 総数を左右のゾーンへランダムに散らす(左右比は固定しない。偶奇混在)
 function makeRoundApples(fruitsTotal) {
   var leftCount = 0, i;
@@ -578,12 +647,13 @@ function makeRoundApples(fruitsTotal) {
 // v0.4: ドリル(LEVELS/5問)を廃止し、自由遊びのラウンド制にする。
 // 1ラウンド = 場の果物を全部さばく(皿に載せる or 食べさせる)+天秤静止1秒で完了。
 // 完了ごとに進行ドットが1つ点灯し、5つ満ちたら幕間を挟んでリセットする(終わりを押し付けない)。
-function newRoundState(fruitsTotal) {
+function newRoundState(fruitsTotal, bigFruits) {
   var idx = totalRoundIndex;
   totalRoundIndex++;
   return {
     index: idx,
     fruitsTotal: fruitsTotal,
+    bigFruits: bigFruits || 0, // v0.7: このラウンドに出現したおおもの数(生成の瞬間に確定)
     fedL: 0, fedR: 0,
     balanceCelebrations: 0,
     dropOutside: 0,
@@ -610,7 +680,9 @@ function startRound() {
   resetRoundVolatileState();
   var fruitsTotal = pickFruitsTotal();
   apples = makeRoundApples(fruitsTotal);
-  round = newRoundState(fruitsTotal);
+  var bigFruits = applyBigFruits(apples); // v0.7: 生成直後、通常の果物の一部をおおものに置き換える
+  if (bigFruits > 0) relaxTenbinZonesForRadius(); // v0.7.1(監査所見1/3)
+  round = newRoundState(fruitsTotal, bigFruits);
   // 導出状態(皿座標)もこの瞬間に確定させる。最初の物理ステップまでの間に
   // 入力・読み取りが来ても未初期化値 (0,0) を晒さない(台帳#1)
   computePlates();
@@ -621,6 +693,8 @@ function startRoundWithRollIn() {
   resetRoundVolatileState();
   var fruitsTotal = pickFruitsTotal();
   apples = makeRoundApples(fruitsTotal);
+  var bigFruits = applyBigFruits(apples); // v0.7
+  if (bigFruits > 0) relaxTenbinZonesForRadius(); // v0.7.1(監査所見1/3)
   for (var i = 0; i < apples.length; i++) {
     var a = apples[i];
     a.rollTargetX = a.x; a.rollTargetY = a.y;
@@ -628,7 +702,7 @@ function startRoundWithRollIn() {
     a.rollFromY = GROUND_Y + 30;
     a.x = a.rollFromX; a.y = a.rollFromY;
   }
-  round = newRoundState(fruitsTotal);
+  round = newRoundState(fruitsTotal, bigFruits);
   computePlates();
 }
 
@@ -641,17 +715,19 @@ function allResolved() {
   return true;
 }
 
-// 演出の分岐: 両皿空(全部食べさせた)→'fed' / 同数(>=1個)→'balance'(最上位) / 差あり→重い方
+// 演出の分岐: 両皿空(全部食べさせた)→'fed' / 重さ合計が同じ(>=1個)→'balance'(最上位) / 差あり→重い方
+// v0.7: 「個数」ではなく「重さ」で判定する(傾き=重さの合計、と同じ律)。全部重さ1なら従来と同値
 function decideCelebrationType() {
   if (counts.left === 0 && counts.right === 0) return 'fed';
-  if (counts.left === counts.right) return 'balance';
-  return counts.left > counts.right ? 'left' : 'right';
+  if (weights.left === weights.right) return 'balance';
+  return weights.left > weights.right ? 'left' : 'right';
 }
 
 // ログ v2 のラウンドレコードを作る(finalizeRound/goHome の両方から呼ぶ共通経路)
 function roundToRecord(r, endedBy, celebType) {
   return {
     fruitsTotal: r.fruitsTotal,
+    bigFruits: r.bigFruits, // v0.7
     fedL: r.fedL, fedR: r.fedR,
     balanceCelebrations: r.balanceCelebrations,
     clearedBalanced: endedBy === 'cleared' && celebType === 'balance',
@@ -683,12 +759,26 @@ function updateRoundSettle(dt) {
   }
 }
 
+// v0.7: 皿に載っている重さの多重集合(ソート済み文字列)。デバウンスキーに使う——
+// 個数の組ではなく構成そのもの(すいか1個⇄りんご2個の入れ替え等)が変わったら再発火可能にする
+function plateWeightMultiset(side) {
+  var list = [];
+  var order = plateOrder[side];
+  for (var i = 0; i < order.length; i++) {
+    var a = appleById(order[i]);
+    if (a) list.push(a.weight);
+  }
+  list.sort(function (x, y) { return x - y; });
+  return list.join('.');
+}
+
 // v0.4: 釣り合い祝福(瞬間の応答・何度でも・デバウンス付き)。
 // updatePhysics で updateRoundSettle の直後に呼ぶ: 同じティックでラウンドが完了して
 // phase が 'play' でなくなっていれば、ここでは発火しない(釣り合い完了が優先)
 function updateBalanceCelebration(dt) {
   if (phase !== 'play' || !round) { balanceHoldMs = 0; return; }
-  var key = counts.left + ',' + counts.right;
+  // v0.7: キーは両皿の重み多重集合(個数の組ではない)
+  var key = plateWeightMultiset('L') + '|' + plateWeightMultiset('R');
   if (key !== balanceLastKey) {
     balanceLastKey = key;
     balanceArmed = true; // 構成が変わったら再び発火可能にする
@@ -757,6 +847,7 @@ function loadLogs(key) {
             .map(function (r) {
               return {
                 fruitsTotal: Number(r.fruitsTotal) || 0,
+                bigFruits: Number(r.bigFruits) || 0,
                 fedL: Number(r.fedL) || 0,
                 fedR: Number(r.fedR) || 0,
                 balanceCelebrations: Number(r.balanceCelebrations) || 0,
@@ -774,6 +865,7 @@ function loadLogs(key) {
             .map(function (r) {
               return {
                 fruitsTotal: Number(r.fruitsTotal) || 0,
+                bigFruits: Number(r.bigFruits) || 0,
                 capacity: Number(r.capacity) || 0,
                 trips: Number(r.trips) || 0,
                 exactFullTrips: Number(r.exactFullTrips) || 0,
@@ -821,20 +913,22 @@ function computePlates() {
 }
 
 // v0.6: 「置いた場所にそのまま吸着」（フィードバック対応。グリッド整列の廃止）。
-// 皿(局所X=皿相対)・甲板(局所X=舟相対)で共有する支え計算: 水平距離|ΔlocalX|<APPLE_R*1.5の
-// 既存の果物があれば、その最上段(localYが最小=一番上)のAPPLE_R*1.7上に積む。無ければbaseYに着地
-function settleLocalY(localX, baseY, supports) {
-  var topY = null;
+// 皿(局所X=皿相対)・甲板(局所X=舟相対)で共有する支え計算: 水平距離|ΔlocalX|<(r+support.r)*0.75の
+// 既存の果物があれば、その最上段(localYが最小=一番上)の(r+support.r)*0.85上に積む。無ければbaseYに着地
+// v0.7: おおもの(r可変)対応で実半径ベースに一般化。従来(全てAPPLE_R)と同値になる係数
+// (26+26)*0.75=39=APPLE_R*1.5、(26+26)*0.85=44.2=APPLE_R*1.7
+function settleLocalY(localX, r, baseY, supports) {
+  var top = null;
   for (var i = 0; i < supports.length; i++) {
     var s = supports[i];
-    if (Math.abs(s.localX - localX) < APPLE_R * 1.5) {
-      if (topY === null || s.localY < topY) topY = s.localY;
+    if (Math.abs(s.localX - localX) < (r + s.r) * 0.75) {
+      if (top === null || s.localY < top.localY) top = s;
     }
   }
-  return topY === null ? baseY : (topY - APPLE_R * 1.7);
+  return top === null ? baseY : (top.localY - (r + top.r) * 0.85);
 }
 var PLATE_BASE_LOCAL_Y = -8; // 皿面基準(旧グリッドのrow0値を踏襲)
-var PLATE_LOCAL_X_MAX = PLATE_DISH_RX - APPLE_R + 4; // 皿の外へはみ出させないクランプ幅
+function plateLocalXMax(r) { return PLATE_DISH_RX - r + 4; } // 皿の外へはみ出させないクランプ幅(v0.7: r可変)
 
 // v0.6: 支えを失った果物だけを沈下させる再settle(下ろした時に呼ぶ)。
 // localXは一切変えない——残った果物を並べ直さない、が約束事
@@ -850,8 +944,8 @@ function reflowPlate(side) {
   var settled = [];
   for (var i = 0; i < list.length; i++) {
     var a = list[i];
-    a.plateLocalY = settleLocalY(a.plateLocalX, PLATE_BASE_LOCAL_Y, settled);
-    settled.push({ localX: a.plateLocalX, localY: a.plateLocalY });
+    a.plateLocalY = settleLocalY(a.plateLocalX, a.r, PLATE_BASE_LOCAL_Y, settled);
+    settled.push({ localX: a.plateLocalX, localY: a.plateLocalY, r: a.r });
   }
 }
 
@@ -870,16 +964,16 @@ function plateSupports(side) {
   var order = plateOrder[side];
   for (var i = 0; i < order.length; i++) {
     var o = appleById(order[i]);
-    if (o) supports.push({ localX: o.plateLocalX, localY: o.plateLocalY });
+    if (o) supports.push({ localX: o.plateLocalX, localY: o.plateLocalY, r: o.r });
   }
   return supports;
 }
 // v0.6.1(監査F3): 落下/リリース地点xに対する着地予定localY(スタック考慮)。
 // 捕捉面はこの分だけ持ち上げる——描かれているスタックを果物がすり抜けてから
-// 頂上へテレポートする世界律の破れ(台帳#7と同クラス)を作らない
-function plateRestLocalY(side, x) {
-  var localX = clamp(x - plates[side].x, -PLATE_LOCAL_X_MAX, PLATE_LOCAL_X_MAX);
-  return settleLocalY(localX, PLATE_BASE_LOCAL_Y, plateSupports(side));
+// 頂上へテレポートする世界律の破れ(台帳#7と同クラス)を作らない。rは着地する果物の実半径(v0.7)
+function plateRestLocalY(side, x, r) {
+  var localX = clamp(x - plates[side].x, -plateLocalXMax(r), plateLocalXMax(r));
+  return settleLocalY(localX, r, PLATE_BASE_LOCAL_Y, plateSupports(side));
 }
 // v0.6: 載せる瞬間は実位置からlocalXを確定し(置いた場所を保持)、既存の果物への支えが
 // あればその上に積む。既存の果物の位置は一切動かさない
@@ -887,9 +981,9 @@ function snapToPlate(a, side) {
   a.state = 'plate';
   a.plate = side;
   a.scale = 1;
-  var localX = clamp(a.x - plates[side].x, -PLATE_LOCAL_X_MAX, PLATE_LOCAL_X_MAX);
+  var localX = clamp(a.x - plates[side].x, -plateLocalXMax(a.r), plateLocalXMax(a.r));
   a.plateLocalX = localX;
-  a.plateLocalY = settleLocalY(localX, PLATE_BASE_LOCAL_Y, plateSupports(side));
+  a.plateLocalY = settleLocalY(localX, a.r, PLATE_BASE_LOCAL_Y, plateSupports(side));
   plateOrder[side].push(a.id);
   var impulse = 34 + rng() * 10;
   balance.vel += side === 'R' ? impulse : -impulse;
@@ -899,19 +993,21 @@ function snapToPlate(a, side) {
 // v0.4: 口ゾーン(食べさせ=引き算の捕捉域)。果物の実位置基準で判定する。
 // 円ではなく「口から足元までの縦カプセル」——体のどこに渡しても食べる
 // （足元だけ食べない帯は「拒食に見える応答の空白」になる。監査F2）。
-// 水平方向の張り出しは r のまま＝皿捕捉帯との非重複 invariant は不変
+// v0.7.1(監査所見2): 捕捉は果物の実半径ぶん外側まで——おおものだけ「縁が触れているのに
+// 食べない」帯を作らない(#14と同クラス)。おおもの半径込みでも皿捕捉帯とは重ならない
+// (幾何 invariant をハーネスが最大半径で検証する)
 var MOUTH_FOOT_Y = 700; // 地面。カプセル下端
-function mouthContains(mouth, x, y) {
+function mouthContains(mouth, x, y, r) {
   var cy = Math.max(mouth.y, Math.min(MOUTH_FOOT_Y, y));
   var dx = x - mouth.x, dy = y - cy;
-  return Math.sqrt(dx * dx + dy * dy) <= mouth.r + APPLE_R;
+  return Math.sqrt(dx * dx + dy * dy) <= mouth.r + (r || APPLE_R);
 }
 // v0.5: どちらのゲームが対象かでMOUTHS(てんびん)/OFUNE_MOUTHS(おふね)を切り替える
 function activeMouths() { return currentGame === 'ofune' ? OFUNE_MOUTHS : MOUTHS; }
-function findMouthAt(x, y) {
+function findMouthAt(x, y, r) {
   var m = activeMouths();
-  if (mouthContains(m.L, x, y)) return 'L';
-  if (mouthContains(m.R, x, y)) return 'R';
+  if (mouthContains(m.L, x, y, r)) return 'L';
+  if (mouthContains(m.R, x, y, r)) return 'R';
   return null;
 }
 // 食べさせ(引き算)。どんな状態でも拒食しない——皿の上の果物をつまんで放しても食べる。
@@ -938,7 +1034,7 @@ function tryCatchByPlate(a, prevY) {
     // v0.6.1(監査F3): スタック頂上の面(着地予定の18px上=皿面と同じ間合い)か、
     // 元の皿面帯か、どちらかを跨いだら捕捉(持ち上げた面の下に不感帯を作らない)
     var baseS = p.y - PLATE_CATCH_BAND_OFFSET;
-    var raisedS = baseS + (plateRestLocalY(side, a.x) - PLATE_BASE_LOCAL_Y);
+    var raisedS = baseS + (plateRestLocalY(side, a.x, a.r) - PLATE_BASE_LOCAL_Y);
     if ((prevY < raisedS && a.y >= raisedS) || (prevY < baseS && a.y >= baseS)) {
       snapToPlate(a, side);
       return true;
@@ -954,7 +1050,7 @@ function updateGroundApple(a, dt) {
   a.vy += GRAVITY * dt;
   a.x += a.vx * dt;
   a.y += a.vy * dt;
-  var mouthSide = findMouthAt(a.x, a.y);
+  var mouthSide = findMouthAt(a.x, a.y, a.r);
   if (mouthSide) { feedApple(a, mouthSide); return; }
   if (tryCatchByPlate(a, prevY)) return; // 皿に捕捉された(state='plate' に遷移済み)
   if (a.x < APPLE_R + 10) { a.x = APPLE_R + 10; a.vx = -a.vx * 0.4; }
@@ -1073,12 +1169,16 @@ function updateHomePress(dt) {
 
 function updatePhysics(dt) {
   counts.left = 0; counts.right = 0;
+  weights.left = 0; weights.right = 0;
   for (var i = 0; i < apples.length; i++) {
-    if (apples[i].state === 'plate') {
-      if (apples[i].plate === 'L') counts.left++; else counts.right++;
+    var ap = apples[i];
+    if (ap.state === 'plate') {
+      if (ap.plate === 'L') { counts.left++; weights.left += ap.weight; }
+      else { counts.right++; weights.right += ap.weight; }
     }
   }
-  balance.target = Math.max(-30, Math.min(30, (counts.right - counts.left) * 6));
+  // v0.7: 傾き=個数の差ではなく重さ合計の差(全部重さ1なら従来と完全同値)
+  balance.target = Math.max(-30, Math.min(30, (weights.right - weights.left) * 6));
   var accel = SPRING_K * (balance.target - balance.angle) - SPRING_C * balance.vel;
   balance.vel += accel * dt;
   balance.angle += balance.vel * dt;
@@ -1135,11 +1235,12 @@ function makeOfuneRoundApples(fruitsTotal) {
   }
   return list;
 }
-function newOfuneRoundState(fruitsTotal, capacity) {
+function newOfuneRoundState(fruitsTotal, capacity, bigFruits) {
   var idx = totalRoundIndex;
   totalRoundIndex++;
   return {
     index: idx, fruitsTotal: fruitsTotal, capacity: capacity,
+    bigFruits: bigFruits || 0, // v0.7: このラウンドに出現したおおもの数(生成の瞬間に確定)
     trips: 0, exactFullTrips: 0, overflowEvents: 0, directFeeds: 0, splashes: 0,
     startSimMs: simTimeMs, recorded: false
   };
@@ -1161,7 +1262,9 @@ function startOfuneRound() {
   var fruitsTotal = pickOfuneFruitsTotal();
   var capacity = pickOfuneCapacity();
   apples = makeOfuneRoundApples(fruitsTotal);
-  round = newOfuneRoundState(fruitsTotal, capacity);
+  var bigFruits = applyBigFruits(apples); // v0.7: 生成直後、通常の果物の一部をおおものに置き換える
+  if (bigFruits > 0) relaxApplesForRadius(apples, OFUNE_FIELD_ZONE); // v0.7.1(監査所見1/3)
+  round = newOfuneRoundState(fruitsTotal, capacity, bigFruits);
   boat.capacity = capacity;
 }
 // 通常のラウンド間(1.5秒遷移): 果物は画面下からころころ転がり込む(tenbinのupdateTransitionを共用)
@@ -1170,6 +1273,8 @@ function startOfuneRoundWithRollIn() {
   var fruitsTotal = pickOfuneFruitsTotal();
   var capacity = pickOfuneCapacity();
   apples = makeOfuneRoundApples(fruitsTotal);
+  var bigFruits = applyBigFruits(apples); // v0.7
+  if (bigFruits > 0) relaxApplesForRadius(apples, OFUNE_FIELD_ZONE); // v0.7.1(監査所見1/3)
   for (var i = 0; i < apples.length; i++) {
     var a = apples[i];
     a.rollTargetX = a.x; a.rollTargetY = a.y;
@@ -1177,7 +1282,7 @@ function startOfuneRoundWithRollIn() {
     a.rollFromY = OFUNE_GROUND_Y + 30;
     a.x = a.rollFromX; a.y = a.rollFromY;
   }
-  round = newOfuneRoundState(fruitsTotal, capacity);
+  round = newOfuneRoundState(fruitsTotal, capacity, bigFruits);
   boat.capacity = capacity;
 }
 // ラウンド完了条件: 全ての果物がeaten(拒食も✗もない。進行不能を作らない)
@@ -1193,7 +1298,7 @@ function decideOfuneCelebrationType() {
 }
 function ofuneRoundToRecord(r, endedBy) {
   return {
-    fruitsTotal: r.fruitsTotal, capacity: r.capacity,
+    fruitsTotal: r.fruitsTotal, bigFruits: r.bigFruits, capacity: r.capacity,
     trips: r.trips, exactFullTrips: r.exactFullTrips,
     overflowEvents: r.overflowEvents, directFeeds: r.directFeeds, splashes: r.splashes,
     durationMs: Math.round(simTimeMs - r.startSimMs), endedBy: endedBy
@@ -1221,24 +1326,29 @@ function deckSurfaceY() { return boat.y - boat.h; }
 function cargoBaseY() { return boat.y - boat.h / 2 - 6; }
 // v0.6.1(監査F3): 帯の上端はスタックの高さぶん持ち上げ、下端は元の甲板線のまま
 // （持ち上げた面と甲板線の間に不感帯を作らない——甲板線めがけて放す操作は従来どおり載る）
-function overlapsDeck(x, y) {
-  if (Math.abs(x - boat.x) > BOAT_DECK_HALF_W) return false;
+// v0.7.1(監査所見2): 水平半幅は果物の実半径ぶん広げる——おおものだけ「縁が船体に
+// 触れているのにかすめて水没する」帯(約9px)を作らない(#14と同クラスの応答の空白)。
+// 皿の捕捉半幅は据え置き(広げると口カプセルと12px重なり、上から落とす操作を皿が横取りする#9が再発する。
+// おおものが皿を4pxかすめて落ちるのは許容——拾い直せる・口との作用先一意性を優先)
+function deckHalfWFor(r) { return BOAT_DECK_HALF_W + ((r || APPLE_R) - APPLE_R); }
+function overlapsDeck(x, y, r) {
+  if (Math.abs(x - boat.x) > deckHalfWFor(r)) return false;
   var base = deckSurfaceY();
-  var raised = base + deckStackRise(x);
+  var raised = base + deckStackRise(x, r);
   return y >= raised - BOAT_DECK_BAND_ABOVE && y <= base + BOAT_DECK_BAND_BELOW;
 }
 // 落下中、下向き(vy>0)に甲板捕捉面を毎ステップ跨いだかを判定する(tryCatchByPlateと同型)。
 // v0.6.1(監査F3): スタック頂上の面か、元の甲板線か、どちらかを跨いだら捕捉
 function tryCatchByDeck(a, prevY) {
   if (a.vy <= 0) return false;
-  if (Math.abs(a.x - boat.x) > BOAT_DECK_HALF_W) return false;
+  if (Math.abs(a.x - boat.x) > deckHalfWFor(a.r)) return false;
   var base = deckSurfaceY();
-  var raised = base + deckStackRise(a.x);
+  var raised = base + deckStackRise(a.x, a.r);
   if ((prevY < raised && a.y >= raised) || (prevY < base && a.y >= base)) { loadFruitOntoBoat(a); return true; }
   return false;
 }
 var BOAT_BASE_LOCAL_Y = 0; // 甲板面基準(旧グリッドのrow0値を踏襲)
-var BOAT_LOCAL_X_MAX = BOAT_W / 2 - APPLE_R + 2; // 甲板の外へはみ出させないクランプ幅
+function boatLocalXMax(r) { return BOAT_W / 2 - r + 2; } // 甲板の外へはみ出させないクランプ幅(v0.7: r可変)
 
 // v0.6: 「置いた場所にそのまま吸着」（プレートと同じ支え計算をsettleLocalYで共有）。
 // 支えを失った果物だけを沈下させる再settle(降ろした時に呼ぶ)。localXは変えない
@@ -1252,12 +1362,12 @@ function reflowDeck() {
   var settled = [];
   for (var i = 0; i < list.length; i++) {
     var a = list[i];
-    a.boatLocalY = settleLocalY(a.boatLocalX, BOAT_BASE_LOCAL_Y, settled);
-    settled.push({ localX: a.boatLocalX, localY: a.boatLocalY });
+    a.boatLocalY = settleLocalY(a.boatLocalX, a.r, BOAT_BASE_LOCAL_Y, settled);
+    settled.push({ localX: a.boatLocalX, localY: a.boatLocalY, r: a.r });
   }
 }
-// あふれ(仕様§1-2): 容量+1個目を積んだ瞬間、世界が引き算を実演する——
-// loadを増やす前に判定するのでloadは容量を1フレームも超えない
+// あふれ(仕様§1-2): 容量+weight目を積んだ瞬間、世界が引き算を実演する——
+// loadを増やす前に判定するのでloadは容量を1フレームも超えない(v0.7: おおものはweight=2ぶん占める)
 function overflowToFloat(a) {
   a.state = 'float';
   a.resting = false; a.vx = 0; a.vy = 0;
@@ -1273,32 +1383,44 @@ function deckSupports() {
   var supports = [];
   for (var i = 0; i < boatCargo.length; i++) {
     var o = appleById(boatCargo[i]);
-    if (o) supports.push({ localX: o.boatLocalX, localY: o.boatLocalY });
+    if (o) supports.push({ localX: o.boatLocalX, localY: o.boatLocalY, r: o.r });
   }
   return supports;
 }
-// v0.6.1(監査F3): 落下/リリース地点xでの捕捉面の持ち上げ量(スタック考慮。plateRestLocalYと同型)
-function deckStackRise(x) {
-  var localX = clamp(x - boat.x, -BOAT_LOCAL_X_MAX, BOAT_LOCAL_X_MAX);
-  return settleLocalY(localX, BOAT_BASE_LOCAL_Y, deckSupports()) - BOAT_BASE_LOCAL_Y;
+// v0.6.1(監査F3): 落下/リリース地点xでの捕捉面の持ち上げ量(スタック考慮。plateRestLocalYと同型)。
+// rは着地する果物の実半径(v0.7)
+function deckStackRise(x, r) {
+  var localX = clamp(x - boat.x, -boatLocalXMax(r), boatLocalXMax(r));
+  return settleLocalY(localX, r, BOAT_BASE_LOCAL_Y, deckSupports()) - BOAT_BASE_LOCAL_Y;
 }
 // v0.6: 載せる瞬間は実位置からlocalXを確定し(置いた場所を保持)、既存の積み荷への支えが
 // あればその上に積む。既存の積み荷の位置は一切動かさない
+// v0.7: 容量=重さの合計。おおもの(weight=2)はcapacity上2個ぶん占める
 function loadFruitOntoBoat(a) {
-  if (boat.load + 1 > boat.capacity) { overflowToFloat(a); return; }
+  if (boat.load + a.weight > boat.capacity) { overflowToFloat(a); return; }
   a.state = 'boat';
   a.resting = false; a.vx = 0; a.vy = 0;
-  var localX = clamp(a.x - boat.x, -BOAT_LOCAL_X_MAX, BOAT_LOCAL_X_MAX);
+  var localX = clamp(a.x - boat.x, -boatLocalXMax(a.r), boatLocalXMax(a.r));
   a.boatLocalX = localX;
-  a.boatLocalY = settleLocalY(localX, BOAT_BASE_LOCAL_Y, deckSupports());
-  boat.load++;
+  a.boatLocalY = settleLocalY(localX, a.r, BOAT_BASE_LOCAL_Y, deckSupports());
+  boat.load += a.weight;
   boatCargo.push(a.id);
   playPlace();
+}
+// v0.7: 容量=重さの合計。boatCargo(id配列)の残り積み荷の重さ合計をloadに同期する共通ヘルパ
+// (存在しないid=既に取り出された果物は0として無視。二重解除に耐える)
+function sumCargoWeight() {
+  var sum = 0;
+  for (var i = 0; i < boatCargo.length; i++) {
+    var a = appleById(boatCargo[i]);
+    if (a) sum += a.weight;
+  }
+  return sum;
 }
 // 対岸で動物が1個ずつ食べる(tenbinのcelebrate自動食べと同じく、これは子どもの「食べさせ」操作
 // ではないのでdirectFeedsは変更しない——舟による配達は別の学習信号)
 // v0.6 防御(台帳#4と同クラス): shiftしたidの果物が既につままれる等でstate!=='boat'に
-// なっていたら食べない(発火時に前提を再検証)。loadは実態(boatCargo.length)に同期し直す
+// なっていたら食べない(発火時に前提を再検証)。loadは実態(重さ合計)に同期し直す
 function unloadNextFruit() {
   var id = boatCargo.shift();
   var a = appleById(id);
@@ -1309,7 +1431,7 @@ function unloadNextFruit() {
     animalBounce[side] = 320;
     playEat();
   }
-  boat.load = boatCargo.length;
+  boat.load = sumCargoWeight();
   reflowDeck();
 }
 // 右岸桟橋への到着(仕様§2): trips/exactFullTripsは到着の瞬間に確定する(荷下ろし完了を待たない)
@@ -1461,10 +1583,10 @@ function enterFloat(a, doSplash) {
 function grabbableCargoApple(x, y) {
   if (!boatIsStationary() || boat.state === 'unloading') return null;
   var best = null, bestD = Infinity;
-  var R = APPLE_R + 10;
   for (var i = 0; i < apples.length; i++) {
     var a = apples[i];
     if (a.state !== 'boat') continue;
+    var R = a.r + 10; // v0.7: おおもの(r可変)は判定円もその分広げる
     var dx = a.x - x, dy = a.y - y;
     var d = Math.sqrt(dx * dx + dy * dy);
     if (d <= R && d < bestD) { best = a; bestD = d; }
@@ -1478,7 +1600,7 @@ function ofunePointerDown(x, y) {
   if (cargo) {
     var idx = boatCargo.indexOf(cargo.id);
     if (idx >= 0) boatCargo.splice(idx, 1);
-    boat.load = boatCargo.length;
+    boat.load = sumCargoWeight(); // v0.7: 容量=重さの合計
     reflowDeck(); // 支え再計算(残った積み荷の沈下)。取った果物のlocalXは以後無関係
     startDragApple(cargo, x, y);
     return;
@@ -1496,11 +1618,11 @@ function releaseOfuneFruit(x, y) {
   a.scale = 1;
   a.moveHistory = null;
   dragApple = null;
-  var mouthSide = findMouthAt(a.x, a.y);
+  var mouthSide = findMouthAt(a.x, a.y, a.r);
   if (mouthSide) { feedApple(a, mouthSide); return; }
   // 静止している舟(桟橋・荷下ろし中・帰航中でほぼ止まっている)の甲板には載る。
   // 動いている舟には載らない（世界律の一貫性。監査F3・v0.6で状態ラベルから実速度判定に拡張）
-  if (boatIsStationary() && overlapsDeck(a.x, a.y)) { loadFruitOntoBoat(a); return; }
+  if (boatIsStationary() && overlapsDeck(a.x, a.y, a.r)) { loadFruitOntoBoat(a); return; }
   a.state = 'field';
   a.resting = false;
   a.vx = clamp(v.vx * DRAG_RELEASE_VEL_SCALE, -DRAG_RELEASE_VEL_CAP, DRAG_RELEASE_VEL_CAP);
@@ -1516,7 +1638,7 @@ function updateOfuneFieldFruit(a, dt) {
   a.vy += GRAVITY * dt;
   a.x += a.vx * dt;
   a.y += a.vy * dt;
-  var mouthSide = findMouthAt(a.x, a.y);
+  var mouthSide = findMouthAt(a.x, a.y, a.r);
   if (mouthSide) { feedApple(a, mouthSide); return; }
   // v0.6: 静止判定を状態ラベルでなく実速度(boatIsStationary)で行う(監査根拠: 帰航尻尾の窓)
   if (boatIsStationary() && tryCatchByDeck(a, prevY)) return;
@@ -1873,7 +1995,8 @@ function findDraggableApple(x, y) {
     var p = appleWorldPos(a);
     var dx = p.x - x, dy = p.y - y;
     var d = Math.sqrt(dx * dx + dy * dy);
-    if (d <= APPLE_TOUCH_R && d < bestD) { best = a; bestD = d; }
+    var touchR = APPLE_TOUCH_R + (a.r - APPLE_R); // v0.7: おおものはタッチ判定も広げる
+    if (d <= touchR && d < bestD) { best = a; bestD = d; }
   }
   return best;
 }
@@ -1905,6 +2028,10 @@ function startDragApple(a, x, y) {
 
 // v0.2: ドラッグ中の指の移動履歴から離した瞬間の速度を推定する(直近数サンプルの平均的な傾き)
 var DRAG_HISTORY_MAX = 6;
+// v0.7: 「手を止めてから放したら、飛ばない」(世界律・原則9)。
+// 履歴は動いた間しか増えないため、止めて狙ってから放すと古いスワイプ速度で射出されていた
+// (実害: 甲板の真上の高い位置から狙って落とすと、横に流されて水没＝「高さの上限」に見える)
+var RELEASE_STALE_MS = 180; // 最後の移動からこれ以上経って放したら速度ゼロ(シミュ時間)
 function recordDragHistory(a, x, y) {
   if (!a.moveHistory) a.moveHistory = [];
   a.moveHistory.push({ t: simTimeMs, x: x, y: y });
@@ -1914,7 +2041,8 @@ function computeDragVelocity(a) {
   var hist = a.moveHistory;
   if (!hist || hist.length < 2) return { vx: 0, vy: 0 };
   var first = hist[0], last = hist[hist.length - 1];
-  var dt = (last.t - first.t) / 1000;
+  if (simTimeMs - last.t > RELEASE_STALE_MS) return { vx: 0, vy: 0 }; // 止めてから放した
+  var dt = (simTimeMs - first.t) / 1000; // 窓を「今」まで伸ばす: 保持した分だけ自然減衰
   if (dt <= 0.001) return { vx: 0, vy: 0 };
   return { vx: (last.x - first.x) / dt, vy: (last.y - first.y) / dt };
 }
@@ -1923,7 +2051,7 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 // リリース位置が既に皿面帯に重なっている(=皿に重ねて放した)場合のみ即着地扱い。
 // 帯には下限がある——皿より下の空間・地面は皿ではない（動物に放す・地面の果物を
 // タップした操作が皿へワープしてはならない。世界律の一貫性）
-function findOverlappingPlateAtRelease(x, y) {
+function findOverlappingPlateAtRelease(x, y, r) {
   var sides = ['L', 'R'];
   var best = null, bestD = Infinity;
   for (var i = 0; i < sides.length; i++) {
@@ -1932,7 +2060,7 @@ function findOverlappingPlateAtRelease(x, y) {
     var dx = Math.abs(x - p.x);
     if (dx > PLATE_CATCH_HALF_W) continue;
     // v0.6.1(監査F3): 重なり帯の上限もスタックの高さぶん持ち上がる(スタックに重ねて放したら即着地)
-    if (y < p.y - PLATE_CATCH_BAND_OFFSET + (plateRestLocalY(side, x) - PLATE_BASE_LOCAL_Y)) continue; // まだ着地面より上 → 通常どおり落下させる
+    if (y < p.y - PLATE_CATCH_BAND_OFFSET + (plateRestLocalY(side, x, r) - PLATE_BASE_LOCAL_Y)) continue; // まだ着地面より上 → 通常どおり落下させる
     if (y > p.y + PLATE_CATCH_BELOW) continue;       // 皿より下 → 皿ではない。落下させる
     if (dx < bestD) { bestD = dx; best = side; }
   }
@@ -1950,9 +2078,9 @@ function releaseDragApple(x, y) {
   dragApple = null;
   // 判定は果物の実位置（lerp 追従後）で行う。ポインタと実体の乖離で
   // 「見えている場所と違う場所に作用する」を作らない
-  var mouthSide = findMouthAt(a.x, a.y);
+  var mouthSide = findMouthAt(a.x, a.y, a.r);
   if (mouthSide) { feedApple(a, mouthSide); return; }
-  var plateSide = findOverlappingPlateAtRelease(a.x, a.y);
+  var plateSide = findOverlappingPlateAtRelease(a.x, a.y, a.r);
   if (plateSide) { snapToPlate(a, plateSide); return; }
   a.state = 'ground';
   a.resting = false;
@@ -3029,7 +3157,7 @@ function installTenbinHook() {
         if (currentGame === 'ofune') {
           return {
             index: round.index,
-            fruitsTotal: round.fruitsTotal, capacity: round.capacity,
+            fruitsTotal: round.fruitsTotal, bigFruits: round.bigFruits, capacity: round.capacity,
             trips: round.trips, exactFullTrips: round.exactFullTrips,
             overflowEvents: round.overflowEvents, directFeeds: round.directFeeds, splashes: round.splashes,
             dots: cycleDots
@@ -3037,7 +3165,7 @@ function installTenbinHook() {
         }
         return {
           index: round.index,
-          fruitsTotal: round.fruitsTotal,
+          fruitsTotal: round.fruitsTotal, bigFruits: round.bigFruits,
           fedL: round.fedL, fedR: round.fedR,
           balanceCelebrations: round.balanceCelebrations,
           dropOutside: round.dropOutside, removedFromPlate: round.removedFromPlate,
@@ -3048,7 +3176,7 @@ function installTenbinHook() {
     apples: {
       enumerable: true, get: function () {
         return apples.map(function (a) {
-          return { id: a.id, x: a.x, y: a.y, r: a.r, state: a.state, plate: a.plate };
+          return { id: a.id, x: a.x, y: a.y, r: a.r, weight: a.weight, state: a.state, plate: a.plate };
         });
       }
     },
@@ -3056,6 +3184,13 @@ function installTenbinHook() {
       enumerable: true, get: function () {
         if (screen !== 'game' || currentGame === 'ofune') return null;
         return { L: { x: plates.L.x, y: plates.L.y }, R: { x: plates.R.x, y: plates.R.y }, catchHalfW: PLATE_CATCH_HALF_W };
+      }
+    },
+    weights: {
+      enumerable: true, get: function () {
+        // v0.7: 皿の重さ合計。てんびんのみ(おふねは容量=load/capacityで別に表現)
+        if (screen !== 'game' || currentGame === 'ofune') return null;
+        return { left: weights.left, right: weights.right };
       }
     },
     boat: {

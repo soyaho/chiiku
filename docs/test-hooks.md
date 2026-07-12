@@ -9,7 +9,7 @@
 | パラメータ | 意味 |
 |---|---|
 | `?seed=<uint>` | 乱数シード（mulberry32等）。配置・果物総数・テーマを決定的にする。省略時は非決定 |
-| `?timescale=<float>` | シミュレーション時間の倍率（既定1）。固定タイムステップ（1/120s）の積分回数を増やして加速する。**物理のdtは変えない**。ゲーム内の全タイマー（静止判定・釣り合い判定1.2s・遷移・幕間・長押し・おうち押し込み・演出・ログms計測）はシミュレーション時間基準 |
+| `?timescale=<float>` | シミュレーション時間の倍率（既定1）。固定タイムステップ（1/120s）の積分回数を増やして加速する。**物理のdtは変えない**。ゲーム内の全タイマー（静止判定・釣り合い判定1.2s・遷移・幕間・長押し・おうち押し込み・演出・ログms計測）はシミュレーション時間基準。**注意（v0.7）**: リリース速度は最終移動から180ms（シミュ時間）で失効するため、投げの速度を検証するテストは移動直後に up すること（timescale=8 なら実時間22.5ms相当） |
 | `?game=tenbin\|ofune` | タイトル/メニューを飛ばして直接入場。未知の値（旧 `wakekko` 含む）は tenbin にフォールバック。実経路（タイトル→メニュー→ゲーム）はナビゲーションシナリオが実タップで別途通す |
 
 ## 読み取り面 `window.__tenbin`（全て読み取り専用）
@@ -26,11 +26,12 @@ window.__tenbin = {
   phase,            // 'play' | 'celebrate' | 'transition' | 'interlude'
   round,            // 進行中ラウンドのライブビュー（操作の瞬間に確定した値）。ゲーム外は null
                     //   てんびん: {index, fruitsTotal, fedL, fedR, balanceCelebrations,
-                    //              dropOutside, removedFromPlate, dots}
+                    //              dropOutside, removedFromPlate, bigFruits, dots}
                     //   おふね:   {index, fruitsTotal, capacity, trips, exactFullTrips,
-                    //              overflowEvents, directFeeds, splashes, dots}
+                    //              overflowEvents, directFeeds, splashes, bigFruits, dots}
                     //   dots = 現サイクルで点灯している進行ドット数(0..5)
-  apples,           // [{id, x, y, r, state, plate}] 論理座標。
+                    //   bigFruits = そのラウンドに出現したおおもの数(v0.7)
+  apples,           // [{id, x, y, r, state, plate, weight}] 論理座標。weight: 通常1/おおもの2(v0.7)。
                     //   てんびん state: 'field'|'drag'|'plate'|'ground'|'eaten'
                     //   おふね   state: 'field'|'drag'|'boat'|'float'|'eaten'
                     //   果物保存 invariant: どのスナップショットでも全果物が既知 state・総数不変
@@ -43,6 +44,7 @@ window.__tenbin = {
                     //   (x,y)〜(x,footY) を軸とする半径 r）。おふねでは右岸の動物2匹に適用
   balance,          // てんびん: {angle, vel, target}（度。angle>0 = 右が下）。おふね/ゲーム外は null
   counts,           // てんびん: {left, right} 皿に載っている個数。おふね/ゲーム外: null
+  weights,          // てんびん: {left, right} 皿に載っている重さ合計(v0.7)。おふね/ゲーム外: null
   orientationBlocked, // 縦持ちブロック中か
   menuOpen,         // 親メニュー表示中か
   menuRegions,      // menuOpen時のみ {copy, clear, close, bgm} 各 {x,y,w,h}。非表示時 null
