@@ -583,6 +583,7 @@ function serve() {
       ]));
       localStorage.setItem('ofune_logs', JSON.stringify([
         { sessionStart: 'y', game: 'ofune', v: 1, rounds: [{ fruitsTotal: '7', capacity: 3, trips: null }] }, null,
+        { sessionStart: 'z', rounds: [{ trips: '3', overflowEvents: '2' }] }, // v/game 欠損の破損レコード（監査F2）
       ]));
     });
     await page.reload();
@@ -605,6 +606,10 @@ function serve() {
       const parsed = JSON.parse(clip);
       assert(Array.isArray(parsed.tenbin) && Array.isArray(parsed.wakekko) && Array.isArray(parsed.ofune),
         'copied JSON contains tenbin + ofune + legacy wakekko');
+      // 監査F2: v/game 欠損の破損レコードでも rounds の数値が正規化されている
+      const z = parsed.ofune.find(x => x && x.sessionStart === 'z');
+      assert(z && typeof z.rounds[0].trips === 'number' && z.rounds[0].trips === 3,
+        `v-less corrupt rounds normalized, got ${JSON.stringify(z)}`);
     }
     // 消去は3キー
     await tapRegion(menu.menuRegions.clear);
@@ -671,6 +676,37 @@ function serve() {
       if (sg !== 0) prev = sg;
     }
     assert(flips >= 2, `boat bobs with >=2 overshoot flips, got ${flips} (n=${series.length})`);
+  });
+
+  // --- 監査F3: 荷下ろし中（静止して見える舟）の甲板にも果物は載る（すり抜けない） ---
+  await test('ofune load onto unloading boat: no slip-through into water', async () => {
+    // ts=2 ページの続き（spring テストで1個積載済み）。容量まで積んで出航
+    for (;;) {
+      const s = await snap();
+      if (s.boat.load >= s.boat.capacity) break;
+      const f = await findOfuneFruit();
+      assert(f, 'free fruit available');
+      await loadOne(f);
+    }
+    const s0 = await snap();
+    await dragFling({ x: s0.boat.x, y: s0.boat.y + s0.boat.h / 3 },
+      { x: s0.boat.x + 320, y: s0.boat.y + s0.boat.h / 3 });
+    const u = await waitFor(async () => {
+      const s = await snap();
+      return s.boat.state === 'unloading' ? s : null;
+    }, 'boat unloading at far shore', 30_000, 20);
+    // 荷下ろし中の甲板に別の果物を放す（ts=2 なので窓は十分）
+    const f = await findOfuneFruit();
+    assert(f, 'a fruit remains on shore');
+    const splashesBefore = u.round.splashes;
+    const cur = await snap();
+    await drag({ x: f.x, y: f.y }, { x: cur.boat.x, y: cur.boat.y - cur.boat.h });
+    await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === f.id);
+      return (a.state === 'boat' || a.state === 'eaten') ? a : null;
+    }, 'fruit lands on stationary boat (not through it)', 15_000);
+    assert((await snap()).round.splashes === splashesBefore, 'no splash: fruit did not slip into water');
   });
 
   await test('ofune boot: world exposed, tenbin-only getters null, conservation holds', async () => {
@@ -755,6 +791,34 @@ function serve() {
     await dragFling({ x: s.boat.x, y: s.boat.y + s.boat.h / 3 },
       { x: s.boat.x + 260, y: s.boat.y + s.boat.h / 3 });
     await waitFor(async () => (await snap()).boat.state === 'dock', 'boat comes back to dock', 30_000);
+  });
+
+  // --- 監査F1: 弱いリリースで舟が水中に置き去りにならない（流れが必ず桟橋へ戻す） ---
+  await test('ofune slow release mid-water: current brings boat back to dock', async () => {
+    const s0 = await snap();
+    const dockX = s0.boat.x;
+    const hullY = s0.boat.y + s0.boat.h / 3;
+    const a = await toClient(s0.boat.x, hullY);
+    const b = await toClient(600, hullY);
+    await page.mouse.move(a.x, a.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, 50));
+    for (let i = 1; i <= 8; i++) {
+      await page.mouse.move(a.x + (b.x - a.x) * i / 8, a.y);
+      await new Promise(r => setTimeout(r, 30));
+    }
+    // 終端で微小ジッタ＝リリース速度を実質ゼロに（「ゆっくり離す」の再現）
+    for (let i = 0; i < 6; i++) {
+      await page.mouse.move(b.x + (i % 2), b.y);
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const mid = await snap();
+    assert(mid.boat.x > 520, `boat was actually dragged mid-water, got x=${Math.round(mid.boat.x)}`);
+    await page.mouse.up();
+    await waitFor(async () => {
+      const s = await snap();
+      return s.boat.state === 'dock' && Math.abs(s.boat.x - dockX) < 20;
+    }, 'boat drifts back to dock after weak release', 30_000);
   });
 
   await test('ofune round completes (mixed means), log v1 schema, next round starts', async () => {

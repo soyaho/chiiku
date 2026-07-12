@@ -745,7 +745,9 @@ function loadLogs(key) {
     return parsed
       .filter(function (x) { return x && typeof x === 'object' && !Array.isArray(x); })
       .map(function (s) {
-        if (s.v === 2 && Array.isArray(s.rounds)) {
+        // 正規化はレコードの自己申告(v/game)ではなく「どのキーから読んだか」で決める。
+        // v/game 欠損の破損レコードが正規化をすり抜けて統計を壊さないように（監査F2）
+        if (key === 'tenbin_logs' && Array.isArray(s.rounds)) {
           s.rounds = s.rounds
             .filter(function (r) { return r && typeof r === 'object'; })
             .map(function (r) {
@@ -761,8 +763,8 @@ function loadLogs(key) {
                 endedBy: r.endedBy === 'home' ? 'home' : 'cleared'
               };
             });
-        } else if (s.v === 1 && s.game === 'ofune' && Array.isArray(s.rounds)) {
-          // v0.5: おふねv1も同水準で数値正規化する(台帳#16と同クラスの再発防止)
+        } else if (key === 'ofune_logs' && Array.isArray(s.rounds)) {
+          // おふねv1も同水準で数値正規化する(台帳#16と同クラスの再発防止)
           s.rounds = s.rounds
             .filter(function (r) { return r && typeof r === 'object'; })
             .map(function (r) {
@@ -1320,7 +1322,13 @@ function releaseBoatHull() {
   var raw = clamp(v.vx * BOAT_RELEASE_VEL_SCALE, -BOAT_RELEASE_VEL_CAP, BOAT_RELEASE_VEL_CAP);
   var vx0 = raw / boatMass(boat.load);
   // タップ・微小揺れでは出航しない(世界律の特例=タップ出航を作らない。仕様§4)
-  if (vx0 < BOAT_MIN_LAUNCH_VX) { boat.vx = 0; return; }
+  if (vx0 < BOAT_MIN_LAUNCH_VX) {
+    // 弱いリリース: 桟橋から動かされていたら流れが必ず戻す（仕様§1-5。
+    // 水中に'dock'のまま置き去り＝「何も起きない」を作らない。監査F1）
+    boat.vx = 0;
+    if (Math.abs(boat.x - BOAT_DOCK_X) > 2) boat.state = 'returning';
+    return;
+  }
   boat.vx = vx0;
   boat.state = 'sailing';
 }
@@ -1355,7 +1363,8 @@ function releaseOfuneFruit(x, y) {
   dragApple = null;
   var mouthSide = findMouthAt(a.x, a.y);
   if (mouthSide) { feedApple(a, mouthSide); return; }
-  if (boat.state === 'dock' && overlapsDeck(a.x, a.y)) { loadFruitOntoBoat(a); return; }
+  // 静止している舟（桟橋・荷下ろし中）の甲板には載る。動く舟には載らない（世界律の一貫性。監査F3）
+  if ((boat.state === 'dock' || boat.state === 'unloading') && overlapsDeck(a.x, a.y)) { loadFruitOntoBoat(a); return; }
   a.state = 'field';
   a.resting = false;
   a.vx = clamp(v.vx * DRAG_RELEASE_VEL_SCALE, -DRAG_RELEASE_VEL_CAP, DRAG_RELEASE_VEL_CAP);
@@ -1373,7 +1382,7 @@ function updateOfuneFieldFruit(a, dt) {
   a.y += a.vy * dt;
   var mouthSide = findMouthAt(a.x, a.y);
   if (mouthSide) { feedApple(a, mouthSide); return; }
-  if (boat.state === 'dock' && tryCatchByDeck(a, prevY)) return;
+  if ((boat.state === 'dock' || boat.state === 'unloading') && tryCatchByDeck(a, prevY)) return;
   if (isOverWaterX(a.x) && prevY < OFUNE_WATER_TOP && a.y >= OFUNE_WATER_TOP) { enterFloat(a, true); return; }
   if (a.x < APPLE_R + 10) { a.x = APPLE_R + 10; a.vx = -a.vx * 0.4; }
   if (a.x > LOGICAL_W - APPLE_R - 10) { a.x = LOGICAL_W - APPLE_R - 10; a.vx = -a.vx * 0.4; }
@@ -2066,10 +2075,11 @@ function computeStatsFor(game) {
         var r = s.rounds[j];
         if (!r || typeof r !== 'object') continue;
         rounds++;
-        trips += r.trips || 0;
-        exactFull += r.exactFullTrips || 0;
-        overflow += r.overflowEvents || 0;
-        directFeeds += r.directFeeds || 0;
+        // 読み手側でも数値化する（正規化をすり抜けたデータへの最終防衛。監査F2）
+        trips += Number(r.trips) || 0;
+        exactFull += Number(r.exactFullTrips) || 0;
+        overflow += Number(r.overflowEvents) || 0;
+        directFeeds += Number(r.directFeeds) || 0;
       }
     }
     return { sessions: sessions, rounds: rounds, trips: trips, exactFull: exactFull, overflow: overflow, directFeeds: directFeeds };
@@ -2083,8 +2093,8 @@ function computeStatsFor(game) {
       var rr = ss.rounds[jj];
       if (!rr || typeof rr !== 'object') continue;
       roundsT++;
-      balanceCount += rr.balanceCelebrations || 0;
-      fed += (rr.fedL || 0) + (rr.fedR || 0);
+      balanceCount += Number(rr.balanceCelebrations) || 0;
+      fed += (Number(rr.fedL) || 0) + (Number(rr.fedR) || 0);
     }
   }
   return { sessions: sessions, rounds: roundsT, balance: balanceCount, fed: fed };
