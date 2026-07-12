@@ -1143,6 +1143,107 @@ function serve() {
     await waitFor(async () => (await snap()).boat.state === 'dock', 'boat back to dock state', 5_000);
   });
 
+  // ===== v0.6.1 監査所見（F1/F2/F3）の再現シナリオ =====
+
+  await test('ofune: deck fruit can be taken back while boat is quasi-stationary (F1)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const s0 = await snap();
+    const dockX = s0.boat.x;
+    await weakDragBoatTo(620);
+    await waitFor(async () => (await snap()).boat.state === 'returning', 'boat returning', 5_000, 10);
+    // ほぼ帰着の窓（まだ returning）で果物を載せる
+    const f = await findOfuneFruit();
+    assert(f, 'free fruit available');
+    const from = await toClient(f.x, f.y);
+    const hold = await toClient(dockX, s0.boat.y - s0.boat.h - 6);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    for (let i = 1; i <= 6; i++) {
+      await page.mouse.move(from.x + (hold.x - from.x) * i / 6, from.y + (hold.y - from.y) * i / 6);
+      await new Promise(r => setTimeout(r, 16));
+    }
+    await waitFor(async () => Math.abs((await snap()).boat.x - dockX) < 24, 'boat almost home', 15_000, 10);
+    await page.mouse.up();
+    await waitFor(async () => {
+      const s = await snap();
+      return s.apples.find(x => x.id === f.id).state === 'boat' ? s : null;
+    }, 'fruit on deck', 10_000, 10);
+    // まだ returning のうちに、いま載せた果物を取り戻す（載る＝取れる、の対称性）
+    const st = await snap();
+    assert(st.boat.state === 'returning', `take-back window still open (returning), got ${st.boat.state}`);
+    const cargo = st.apples.find(x => x.id === f.id);
+    await drag({ x: cargo.x, y: cargo.y }, { x: 180, y: 560 }, { steps: 6, settleMs: 60 });
+    const after = await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === f.id);
+      return a.state === 'field' ? s : null;
+    }, 'fruit taken back from quasi-stationary boat (not the boat itself)', 10_000);
+    assert(after.boat.state !== 'held', 'boat was not picked up instead of the fruit');
+    checkConservation(after);
+  });
+
+  await test('ofune: load+take-back only round is still recorded on home (F2)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const f = await findOfuneFruit();
+    assert(f, 'free fruit available');
+    await loadOne(f);
+    let st = await snap();
+    const cargo = st.apples.find(a => a.state === 'boat');
+    await drag({ x: cargo.x, y: cargo.y }, { x: 180, y: 560 });
+    await waitFor(async () => {
+      const s = await snap();
+      return s.apples.find(x => x.id === cargo.id).state === 'field';
+    }, 'fruit back on shore', 15_000);
+    // カウンタは全て0だが「触った」ラウンド——おうち離脱で記録されること
+    st = await snap();
+    await pressHold({ x: st.homeButton.x + st.homeButton.w / 2, y: st.homeButton.y + st.homeButton.h / 2 },
+      Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 10_000);
+    const logs = await readLogs('ofune_logs');
+    const sess = logs[logs.length - 1];
+    assert(sess && sess.endedBy === 'home', 'session endedBy home');
+    assert(Array.isArray(sess.rounds) && sess.rounds.length >= 1,
+      `round with only load+take-back is recorded, got ${JSON.stringify(sess && sess.rounds)}`);
+  });
+
+  await test('tenbin: falling fruit lands ON the stack, no pass-through teleport (F3)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=tenbin`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    // 同じXに3個積む
+    for (let k = 0; k < 3; k++) {
+      const f = await findFreeFruit();
+      assert(f, `free fruit for stack ${k}`);
+      const p = (await snap()).plates.L;
+      await drag({ x: f.x, y: f.y }, { x: p.x + 8, y: p.y - 60 - k * 44 });
+      await waitFor(async () => {
+        const s = await snap();
+        return s.apples.find(x => x.id === f.id).state === 'plate';
+      }, `stack fruit ${k} lands`, 15_000);
+    }
+    // 4個目をスタックの真上から落とす。落下中〜着地で上向きテレポート(>50px/サンプル)が無いこと
+    const f4 = await findFreeFruit();
+    assert(f4, 'fourth fruit');
+    const s1 = await snap();
+    const p = s1.plates.L;
+    const stackTop = Math.min(...s1.apples.filter(a => a.state === 'plate' && a.plate === 'L').map(a => a.y));
+    await drag({ x: f4.x, y: f4.y }, { x: p.x + 8, y: stackTop - 130 });
+    const series = [];
+    await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === f4.id);
+      series.push(a.y);
+      return a.state === 'plate' ? a : null;
+    }, 'fourth fruit lands on stack', 15_000, 15);
+    let maxUp = 0;
+    for (let i = 1; i < series.length; i++) maxUp = Math.max(maxUp, series[i - 1] - series[i]);
+    assert(maxUp <= 50, `no upward teleport while landing, max upward step ${maxUp.toFixed(1)}px (n=${series.length})`);
+  });
+
   await test('no text during gameplay (guard) & no page errors', async () => {
     const stats = await page.evaluate(() => window.__textStats);
     assert(stats.violations === 0,
