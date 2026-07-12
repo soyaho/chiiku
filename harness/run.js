@@ -214,6 +214,26 @@ async function loadOne(fruit) {
     return (s.boat.load > before.boat.load || s.round.overflowEvents > before.round.overflowEvents) ? s : null;
   }, `fruit ${fruit.id} loaded (or overflowed)`, 15_000);
 }
+// 舟をゆっくり運んで実質ゼロ速度で離す（弱リリース）。x=xTarget まで
+async function weakDragBoatTo(xTarget) {
+  await page.mouse.up().catch(() => {});
+  const s0 = await snap();
+  const hullY = s0.boat.y + s0.boat.h / 3;
+  const a = await toClient(s0.boat.x, hullY);
+  const b = await toClient(xTarget, hullY);
+  await page.mouse.move(a.x, a.y);
+  await page.mouse.down();
+  await new Promise(r => setTimeout(r, 50));
+  for (let i = 1; i <= 8; i++) {
+    await page.mouse.move(a.x + (b.x - a.x) * i / 8, a.y);
+    await new Promise(r => setTimeout(r, 30));
+  }
+  for (let i = 0; i < 6; i++) {
+    await page.mouse.move(b.x + (i % 2), b.y);
+    await new Promise(r => setTimeout(r, 100));
+  }
+  await page.mouse.up();
+}
 async function openParentMenu() {
   const c = await toClient(28, 28);
   await page.mouse.move(c.x, c.y);
@@ -932,6 +952,195 @@ function serve() {
     const menu = await openParentMenu();
     await tapRegion(menu.menuRegions.close);
     await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
+  });
+
+  // ===== v0.6 フィードバック対応（そうぞう・置き場所保持・舟の静止捕捉と可逆性） =====
+
+  await test('branding: document.title is そうぞう', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    const t = await page.title();
+    assert(t === 'そうぞう', `document.title そうぞう, got "${t}"`);
+  });
+
+  await test('tenbin: fruit stays where dropped on plate; removal does not rearrange', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=tenbin`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const offsets = [30, -25, 2]; // 旧グリッド(-36, 0, +36)のどれとも一致しない置き位置
+    const placed = [];
+    for (const off of offsets) {
+      const f = await findFreeFruit();
+      assert(f, 'free fruit available');
+      const p = (await snap()).plates.L;
+      await drag({ x: f.x, y: f.y }, { x: p.x + off, y: p.y - 60 });
+      await waitFor(async () => {
+        const st = await snap();
+        const a = st.apples.find(x => x.id === f.id);
+        return a && a.state === 'plate' ? a : null;
+      }, `fruit ${f.id} lands on plate L`, 15_000);
+      placed.push({ id: f.id, off });
+    }
+    const st = await snap();
+    for (const q of placed) {
+      const a = st.apples.find(x => x.id === q.id);
+      const rel = a.x - st.plates.L.x;
+      assert(Math.abs(rel - q.off) <= 20, `fruit keeps dropped offset ${q.off}, got ${rel.toFixed(1)}`);
+    }
+    // 1個下ろしても残りは並べ直されない
+    const keep = placed.slice(0, 2).map(q => {
+      const a = st.apples.find(x => x.id === q.id);
+      return { id: q.id, rel: a.x - st.plates.L.x };
+    });
+    const victim = st.apples.find(x => x.id === placed[2].id);
+    await drag({ x: victim.x, y: victim.y }, { x: 512, y: 640 });
+    await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === placed[2].id);
+      return a.state !== 'plate' ? a : null;
+    }, 'fruit removed from plate', 15_000);
+    const s2 = await snap();
+    for (const q of keep) {
+      const a = s2.apples.find(x => x.id === q.id);
+      const rel = a.x - s2.plates.L.x;
+      assert(Math.abs(rel - q.rel) <= 2, `remaining fruit ${q.id} not rearranged: ${q.rel.toFixed(1)} → ${rel.toFixed(1)}`);
+    }
+  });
+
+  await test('ofune: fruit stays where dropped on deck (no grid teleport)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const offs = [28, -35]; // 旧グリッド(-30, 0, +30)と一致しない
+    for (const off of offs) {
+      const f = await findOfuneFruit();
+      assert(f, 'free fruit available');
+      const b = (await snap()).boat;
+      await drag({ x: f.x, y: f.y }, { x: b.x + off, y: b.y - b.h });
+      await waitFor(async () => {
+        const st = await snap();
+        const a = st.apples.find(x => x.id === f.id);
+        return a && a.state === 'boat' ? a : null;
+      }, `fruit ${f.id} lands on deck`, 15_000);
+      const st = await snap();
+      const a = st.apples.find(x => x.id === f.id);
+      const rel = a.x - st.boat.x;
+      assert(Math.abs(rel - off) <= 18, `deck fruit keeps offset ${off}, got ${rel.toFixed(1)}`);
+    }
+  });
+
+  await test('ofune: returning boat can be caught by hand (held) and carried home', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=ofune`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    await weakDragBoatTo(620);
+    const mid = await waitFor(async () => {
+      const s = await snap();
+      return (s.boat.state === 'returning' && s.boat.x > 480) ? s : null;
+    }, 'boat returning mid-water', 10_000, 15);
+    const c = await toClient(mid.boat.x - 45, mid.boat.y); // 移動方向に少しリードして掴む
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    try {
+      await waitFor(async () => {
+        const s = await snap();
+        return s.boat.state === 'held' ? s : null;
+      }, 'boat is held by hand', 3_000, 15);
+      const d = await toClient(430, mid.boat.y);
+      for (let i = 1; i <= 6; i++) {
+        await page.mouse.move(c.x + (d.x - c.x) * i / 6, c.y);
+        await new Promise(r => setTimeout(r, 30));
+      }
+      await new Promise(r => setTimeout(r, 250));
+    } finally {
+      await page.mouse.up();
+    }
+    await waitFor(async () => (await snap()).boat.state === 'dock', 'boat settles at dock', 15_000);
+  });
+
+  await test('ofune: fruit loads onto quasi-stationary returning boat near dock', async () => {
+    const s0 = await waitFor(async () => {
+      const s = await snap();
+      return s.boat.state === 'dock' ? s : null;
+    }, 'boat at dock to start', 15_000);
+    const dockX = s0.boat.x;
+    await weakDragBoatTo(600);
+    await waitFor(async () => (await snap()).boat.state === 'returning', 'boat returning', 5_000, 10);
+    // 果物を桟橋の甲板上空に構え、ほぼ帰着（まだ returning）の瞬間に放す
+    const f = await findOfuneFruit();
+    assert(f, 'free fruit available');
+    const from = await toClient(f.x, f.y);
+    const hold = await toClient(dockX, s0.boat.y - s0.boat.h - 6);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    try {
+      await new Promise(r => setTimeout(r, 60));
+      for (let i = 1; i <= 6; i++) {
+        await page.mouse.move(from.x + (hold.x - from.x) * i / 6, from.y + (hold.y - from.y) * i / 6);
+        await new Promise(r => setTimeout(r, 16));
+      }
+      const splashesBefore = (await snap()).round.splashes;
+      await waitFor(async () => {
+        const s = await snap();
+        return (Math.abs(s.boat.x - dockX) < 18) ? s : null;
+      }, 'boat almost home (still returning)', 15_000, 10);
+      await page.mouse.up();
+      await waitFor(async () => {
+        const s = await snap();
+        const a = s.apples.find(x => x.id === f.id);
+        return a.state === 'boat' ? a : null;
+      }, 'fruit loads onto the almost-stationary boat', 10_000);
+      assert((await snap()).round.splashes === splashesBefore, 'no splash: fruit did not fall into water');
+    } finally {
+      await page.mouse.up().catch(() => {});
+    }
+  });
+
+  await test('ofune: fruit can be taken back off a docked boat (reversible)', async () => {
+    await waitFor(async () => (await snap()).boat.state === 'dock', 'boat docked', 15_000);
+    let st = await snap();
+    if (st.boat.load === 0) {
+      const f = await findOfuneFruit();
+      assert(f, 'free fruit to load');
+      await loadOne(f);
+      st = await snap();
+    }
+    const cargo = st.apples.find(a => a.state === 'boat');
+    assert(cargo, 'a fruit is on deck');
+    const loadBefore = st.boat.load;
+    await drag({ x: cargo.x, y: cargo.y }, { x: 180, y: 560 });
+    const after = await waitFor(async () => {
+      const s = await snap();
+      const a = s.apples.find(x => x.id === cargo.id);
+      return (a.state === 'field') ? s : null;
+    }, 'fruit taken back to shore', 15_000);
+    assert(after.boat.load === loadBefore - 1, `load decremented ${loadBefore}→${after.boat.load}`);
+    checkConservation(after);
+  });
+
+  await test('ofune: touching the hull grabs the boat, not nearby deck cargo', async () => {
+    let st = await snap();
+    if (st.boat.load === 0) {
+      const f = await findOfuneFruit();
+      assert(f, 'free fruit to load');
+      await loadOne(f);
+      st = await snap();
+    }
+    // 甲板の果物のタッチ円(62px)圏内だが、指は明らかに船体の上
+    const c = await toClient(st.boat.x, st.boat.y + 14);
+    await page.mouse.up().catch(() => {});
+    await page.mouse.move(c.x, c.y);
+    await page.mouse.down();
+    try {
+      const held = await waitFor(async () => {
+        const s = await snap();
+        return s.boat.state === 'held' ? s : null;
+      }, 'boat grabbed (not the cargo)', 3_000, 15);
+      assert(held.boat.load === st.boat.load, 'cargo untouched');
+    } finally {
+      await page.mouse.up();
+    }
+    await waitFor(async () => (await snap()).boat.state === 'dock', 'boat back to dock state', 5_000);
   });
 
   await test('no text during gameplay (guard) & no page errors', async () => {

@@ -35,8 +35,9 @@ window.__tenbin = {
                     //   おふね   state: 'field'|'drag'|'boat'|'float'|'eaten'
                     //   果物保存 invariant: どのスナップショットでも全果物が既知 state・総数不変
   plates,           // てんびん: {L:{x,y}, R:{x,y}, catchHalfW}。おふね/ゲーム外: null
-  boat,             // おふね: {x, y, w, h, state:'dock'|'sailing'|'unloading'|'returning',
+  boat,             // おふね: {x, y, w, h, state:'dock'|'sailing'|'unloading'|'returning'|'held',
                     //          load, capacity, draft}（x,y=舟の中心。draft=喫水の沈み込みpx）
+                    //   'held'=手に持たれている（v0.6。unloading 以外はいつでも掴める）
                     //   てんびん/ゲーム外: null
   mouths,           // {L:{x,y,r,footY}, R:{...}} 動物の食べさせ捕捉域（縦カプセル。
                     //   (x,y)〜(x,footY) を軸とする半径 r）。おふねでは右岸の動物2匹に適用
