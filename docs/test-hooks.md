@@ -47,7 +47,8 @@ window.__tenbin = {
                     //   invariant: 各塔で r は下から非増加（支えより大きい果物が上にない）。
                     //   他ゲーム/ゲーム外: null
   mouths,           // {L:{x,y,r,footY}, R:{...}} 動物の食べさせ捕捉域（縦カプセル。
-                    //   (x,y)〜(x,footY) を軸とする半径 r）。おふねでは右岸の動物2匹に適用
+                    //   (x,y)〜(x,footY) を軸とする半径 r）。おふねでは右岸の動物2匹に適用。
+                    //   おやまは動物なしのため null（v0.8）
   balance,          // てんびん: {angle, vel, target}（度。angle>0 = 右が下）。おふね/ゲーム外は null
   counts,           // てんびん: {left, right} 皿に載っている個数。おふね/ゲーム外: null
   weights,          // てんびん: {left, right} 皿に載っている重さ合計(v0.7)。おふね/ゲーム外: null
