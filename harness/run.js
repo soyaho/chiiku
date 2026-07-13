@@ -57,7 +57,7 @@ async function snap() {
     return {
       screen: t.screen, game: t.game, menuTiles: t.menuTiles, homeButton: t.homeButton,
       phase: t.phase, round: t.round, apples: t.apples, plates: t.plates, mouths: t.mouths,
-      balance: t.balance, counts: t.counts, weights: t.weights, boat: t.boat,
+      balance: t.balance, counts: t.counts, weights: t.weights, boat: t.boat, towers: t.towers,
       orientationBlocked: t.orientationBlocked, menuOpen: t.menuOpen,
       menuRegions: t.menuRegions, celebrationType: t.celebrationType,
       session: t.session, theme: t.theme, bgmEnabled: t.bgmEnabled, hintActive: t.hintActive,
@@ -1387,6 +1387,323 @@ function serve() {
     const lastRound = sess.rounds[sess.rounds.length - 1];
     assert(lastRound && typeof lastRound.bigFruits === 'number' && lastRound.bigFruits === 1,
       `bigFruits recorded as number 1, got ${JSON.stringify(lastRound && lastRound.bigFruits)}`);
+  });
+
+  // ===== v0.8 第3ゲーム「おやま」（序列と合成。世界律=同じか大きいものの上でだけ落ち着く） =====
+
+  function checkOyamaLaw(s) {
+    assert(s.apples.length === s.round.fruitsTotal, `conservation: ${s.apples.length}/${s.round.fruitsTotal}`);
+    for (const a of s.apples) {
+      assert(['field', 'drag', 'tower'].includes(a.state), `fruit ${a.id} in unknown state '${a.state}'`);
+    }
+    for (const t of s.towers) {
+      let prev = Infinity;
+      for (const id of t.fruits) {
+        const a = s.apples.find(x => x.id === id);
+        assert(a && a.state === 'tower', `tower fruit ${id} has state 'tower'`);
+        assert(a.r <= prev + 0.001, `law: fruit ${id} (r=${a.r}) rests on smaller support (r below=${prev})`);
+        prev = a.r;
+      }
+    }
+  }
+  // 塔の真上に構えて静止リリース（まっすぐ落として塔が捕捉する）
+  async function dropOnTower(fruit, tower) {
+    const cur = (await snap()).apples.find(a => a.id === fruit.id) || fruit;
+    const from = await toClient(cur.x, cur.y);
+    const hold = await toClient(tower.x, 170);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await new Promise(r => setTimeout(r, 50));
+    for (let i = 1; i <= 8; i++) {
+      await page.mouse.move(from.x + (hold.x - from.x) * i / 8, from.y + (hold.y - from.y) * i / 8);
+      await new Promise(r => setTimeout(r, 16));
+    }
+    await new Promise(r => setTimeout(r, 260));
+    await page.mouse.up();
+  }
+
+  await test('oyama sway: stacking causes visible wobble (non-critical damping)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=oyama`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const s = await snap();
+    const biggest = [...s.apples].sort((a, b) => b.r - a.r)[0];
+    await dropOnTower(biggest, s.towers[0]);
+    await waitFor(async () => {
+      const st = await snap();
+      return st.towers[0].fruits.length === 1;
+    }, 'fruit lands on pedestal', 10_000);
+    const series = await page.evaluate(() => new Promise(resolve => {
+      const out = [];
+      const t0 = performance.now();
+      function sample() {
+        const t = window.__tenbin;
+        if (t.towers) out.push(t.towers[0].sway);
+        if (performance.now() - t0 < 3500) requestAnimationFrame(sample);
+        else resolve(out);
+      }
+      requestAnimationFrame(sample);
+    }));
+    let flips = 0, prev = 0;
+    for (const d of series) {
+      const sg = Math.abs(d) < 0.05 ? 0 : Math.sign(d);
+      if (sg !== 0 && prev !== 0 && sg !== prev) flips++;
+      if (sg !== 0) prev = sg;
+    }
+    assert(flips >= 2, `tower wobbles with >=2 sway flips, got ${flips} (n=${series.length})`);
+  });
+
+  await test('oyama: real path via menu tile — pedestals, distinct sizes, other getters null', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await tap({ x: 512, y: 384 }); // title → menu
+    const m = await waitFor(async () => {
+      const s = await snap();
+      return (s.screen === 'menu' && s.menuTiles && s.menuTiles.oyama) ? s : null;
+    }, 'menu shows oyama tile', 5_000);
+    await tapRegion(m.menuTiles.oyama);
+    const s = await waitFor(async () => {
+      const st = await snap();
+      return (st.screen === 'game' && st.game === 'oyama' && st.phase === 'play') ? st : null;
+    }, 'oyama starts from menu', 5_000);
+    assert(s.towers && s.towers.length >= 2 && s.towers.length <= 3, `2-3 pedestals, got ${s.towers && s.towers.length}`);
+    assert(s.round.fruitsTotal >= 4 && s.round.fruitsTotal <= 5, `round 0 has 4-5 fruits, got ${s.round.fruitsTotal}`);
+    const radii = s.apples.map(a => a.r);
+    assert(new Set(radii).size === radii.length, `round 0 sizes all distinct, got ${JSON.stringify(radii)}`);
+    assert(s.round.twins === 0, `twins 0 in round 0, got ${s.round.twins}`);
+    assert(s.plates === null && s.balance === null && s.counts === null && s.boat === null,
+      'tenbin/ofune getters are null in oyama');
+    checkOyamaLaw(s);
+  });
+
+  await test('oyama world law: small stacks, big slides off (one fruit, quiet), take-back sinks upper', async () => {
+    let s = await snap();
+    const desc = [...s.apples].sort((a, b) => b.r - a.r); // A>B>C>D(>E)
+    const [A, B, C, D] = desc;
+    const tw = s.towers[0];
+    await dropOnTower(A, tw);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 1, 'A on pedestal', 10_000);
+    await dropOnTower(D, tw);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 2, 'D (small) stacks on A', 10_000);
+    // B(>D) を上に置こうとする → その1個だけ滑り降りて field に戻る。塔は不変
+    const slidesBefore = (await snap()).round.slideOffs;
+    await dropOnTower(B, tw);
+    await waitFor(async () => {
+      const st = await snap();
+      const b = st.apples.find(x => x.id === B.id);
+      return st.round.slideOffs > slidesBefore && b.state === 'field';
+    }, 'B slides off quietly back to field', 10_000);
+    s = await snap();
+    assert(s.towers[0].fruits.length === 2, 'tower unchanged after slide-off');
+    checkOyamaLaw(s);
+    // D を取り戻してから C, D の順に積み直す（[A,C,D] を作る）
+    const takeBefore = s.round.takeBacks;
+    const dNow = s.apples.find(x => x.id === D.id);
+    await drag({ x: dNow.x, y: dNow.y }, { x: 200, y: 660 });
+    await waitFor(async () => {
+      const st = await snap();
+      return st.round.takeBacks > takeBefore && st.towers[0].fruits.length === 1;
+    }, 'take-back: D removed from tower', 10_000);
+    await dropOnTower(C, tw);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 2, 'C stacks on A', 10_000);
+    await dropOnTower(D, tw);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 3, 'D stacks on C', 10_000);
+    // 中間の C を抜く → 上の D が静かに沈下し、[A,D] は律を満たしたまま
+    const takeBefore2 = (await snap()).round.takeBacks;
+    const cNow = (await snap()).apples.find(x => x.id === C.id);
+    await drag({ x: cNow.x, y: cNow.y }, { x: 200, y: 660 });
+    const after = await waitFor(async () => {
+      const st = await snap();
+      return (st.round.takeBacks > takeBefore2 && st.towers[0].fruits.length === 2) ? st : null;
+    }, 'mid-tower take-back: upper fruit sinks', 10_000);
+    assert(after.towers[0].fruits[0] === A.id && after.towers[0].fruits[1] === D.id, 'tower is [A, D] after mid removal');
+    checkOyamaLaw(after);
+  });
+
+  await test('oyama: single-tower clear recorded, rounds grow, twins arrive at round 2', async () => {
+    // 前テストが塔の頂上に最小の果物を残している。世界律（頂上より大きいものは積めない）に従い、
+    // まず頂上が場の最大より小さい間は取り戻し、そのうえで降順に1本塔へ積む
+    for (let round = 0; round <= 1; round++) {
+      for (;;) {
+        const s0 = await snap();
+        if (s0.phase !== 'play') break;
+        const tw = s0.towers[0];
+        const fieldFruits = s0.apples.filter(a => a.state === 'field');
+        if (tw.fruits.length === 0 || fieldFruits.length === 0) break;
+        const fieldMax = Math.max(...fieldFruits.map(a => a.r));
+        const top = s0.apples.find(x => x.id === tw.fruits[tw.fruits.length - 1]);
+        if (top.r >= fieldMax) break;
+        const n = tw.fruits.length;
+        await drag({ x: top.x, y: top.y }, { x: 200, y: 660 });
+        await waitFor(async () => (await snap()).towers[0].fruits.length < n, 'normalize: take small top back', 10_000);
+      }
+      for (;;) {
+        const s = await snap();
+        if (s.phase !== 'play') break;
+        const field = s.apples.filter(a => a.state === 'field').sort((a, b) => b.r - a.r);
+        if (field.length === 0) break;
+        const before = s.towers[0].fruits.length;
+        await dropOnTower(field[0], s.towers[0]);
+        await waitFor(async () => {
+          const st = await snap();
+          return st.phase !== 'play' || st.towers[0].fruits.length > before;
+        }, `fruit ${field[0].id} stacks (round ${round})`, 10_000);
+      }
+      await waitForRound(round + 1);
+      if (round === 0) {
+        const s1 = await snap();
+        assert(s1.round.fruitsTotal === 5, `round 1 has 5 fruits, got ${s1.round.fruitsTotal}`);
+      }
+    }
+    let s = await snap();
+    assert(s.round.fruitsTotal === 6, `round 2 has 6 fruits (5 tiers + twin pair), got ${s.round.fruitsTotal}`);
+    assert(s.round.twins === 1, `round 2 has exactly one twin pair, got ${s.round.twins}`);
+    const byR = {};
+    for (const a of s.apples) byR[a.r] = (byR[a.r] || 0) + 1;
+    const twinRs = Object.keys(byR).filter(r => byR[r] === 2);
+    assert(twinRs.length === 1, `exactly one duplicated size, got ${JSON.stringify(byR)}`);
+    // ふたごはふたごの上に積める（等値は安定＝第二の発見）
+    const twins = s.apples.filter(a => a.r === Number(twinRs[0]));
+    const empty = s.towers.find(t => t.fruits.length === 0) || s.towers[1];
+    await dropOnTower(twins[0], empty);
+    await waitFor(async () => {
+      const st = await snap();
+      const t = st.towers.find(x => Math.abs(x.x - empty.x) < 2);
+      return t && t.fruits.includes(twins[0].id);
+    }, 'first twin on pedestal', 10_000);
+    await dropOnTower(twins[1], empty);
+    const fin = await waitFor(async () => {
+      const st = await snap();
+      const t = st.towers.find(x => Math.abs(x.x - empty.x) < 2);
+      return (t && t.fruits.includes(twins[1].id)) ? st : null;
+    }, 'twin stacks on its twin (equal size is stable)', 10_000);
+    checkOyamaLaw(fin);
+    // おうちで離脱 → ログ検証（ラウンド0: 1本塔クリアの記録）
+    const st2 = await snap();
+    await pressHold({ x: st2.homeButton.x + st2.homeButton.w / 2, y: st2.homeButton.y + st2.homeButton.h / 2 },
+      Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 10_000);
+    const logs = await readLogs('oyama_logs');
+    const sess = logs[logs.length - 1];
+    assert(sess && Array.isArray(sess.rounds) && sess.rounds.length >= 2, `>=2 rounds logged, got ${JSON.stringify(sess && sess.rounds && sess.rounds.length)}`);
+    const r0 = sess.rounds[0];
+    assert(r0.singleTowerClear === true && Number(r0.towersAtClear) === 1, `round 0 single-tower clear recorded, got ${JSON.stringify(r0)}`);
+    assert(Number(r0.maxHeight) === 4, `round 0 maxHeight 4, got ${r0.maxHeight}`);
+    assert(Number(r0.slideOffs) >= 1 && Number(r0.takeBacks) >= 2, `slideOffs/takeBacks recorded, got ${JSON.stringify(r0)}`);
+  });
+
+  // ===== v0.8.1 監査所見（F1/F4/F9）の再現・再発検出 =====
+
+  await test('oyama F1: grounded fruit beside the rock stays put — no warp onto tower, no slide ping-pong', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=oyama`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    let s = await snap();
+    const desc = [...s.apples].sort((a, b) => b.r - a.r);
+    const tw = s.towers[0];
+    // 頂上に最大の果物（=何でも載ってしまう状態）を作る
+    await dropOnTower(desc[0], tw);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 1, 'big on pedestal', 10_000);
+    // 最小の果物を「岩のすぐ横・地面すれすれ」で放す → 塔ではなく地面に残るべき
+    const small = desc[desc.length - 1];
+    const cur = (await snap()).apples.find(a => a.id === small.id);
+    await drag({ x: cur.x, y: cur.y }, { x: tw.x + 40, y: 692 });
+    await waitFor(async () => {
+      const st = await snap();
+      const a = st.apples.find(x => x.id === small.id);
+      return a.state !== 'drag' ? a : null;
+    }, 'released', 5_000);
+    s = await snap();
+    const a1 = s.apples.find(x => x.id === small.id);
+    assert(a1.state === 'field', `ground-level release beside rock stays field (no warp onto tower), got '${a1.state}'`);
+    assert(s.towers[0].fruits.length === 1, 'tower unchanged');
+    // 地面のその果物をタップ（拾い損ね）→ ワープも滑り降りの往復も起きない
+    const slidesBefore = s.round.slideOffs;
+    const c = await toClient(a1.x, a1.y);
+    await page.mouse.click(c.x, c.y);
+    await new Promise(r => setTimeout(r, 400));
+    const s2 = await snap();
+    const a2 = s2.apples.find(x => x.id === small.id);
+    assert(a2.state === 'field', `tap on grounded fruit does not warp it, got '${a2.state}'`);
+    assert(s2.round.slideOffs === slidesBefore, `no slide-off ping-pong on tap, got ${slidesBefore}→${s2.round.slideOffs}`);
+    checkOyamaLaw(s2);
+  });
+
+  await test('oyama F4: slide-off travels continuously with a wobble (no teleport)', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=2&game=oyama`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    const s = await snap();
+    const asc = [...s.apples].sort((a, b) => a.r - b.r);
+    const tw = s.towers[0];
+    await dropOnTower(asc[0], tw); // 最小を頂上に
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 1, 'small on pedestal', 10_000);
+    // より大きい果物を上に → 滑り降り。位置を毎フレーム追跡してテレポートが無いこと
+    const bigger = asc[1];
+    const tracePromise = page.evaluate(([fid]) => new Promise(resolve => {
+      const out = [];
+      const t0 = performance.now();
+      const slides0 = window.__tenbin.round.slideOffs;
+      let extra = 0;
+      function sample() {
+        const t = window.__tenbin;
+        const a = t.apples.find(x => x.id === fid);
+        const tw0 = t.towers && t.towers[0];
+        const slid = t.round.slideOffs > slides0;
+        out.push({ x: a.x, y: a.y, st: a.state, sway: tw0 ? tw0.sway : 0, slid });
+        if (slid) extra++;
+        if (performance.now() - t0 < 8000 && extra < 30) requestAnimationFrame(sample);
+        else resolve(out);
+      }
+      requestAnimationFrame(sample);
+    }), [bigger.id]);
+    await dropOnTower(bigger, tw);
+    const trace = await tracePromise;
+    const slid = await waitFor(async () => {
+      const st = await snap();
+      const b = st.apples.find(x => x.id === bigger.id);
+      return (st.round.slideOffs >= 1 && b.state === 'field') ? st : null;
+    }, 'bigger fruit slid off to field', 10_000);
+    assert(slid.towers[0].fruits.length === 1, 'tower keeps only the small fruit');
+    assert(trace.some(p => p.slid), 'trace captured the slide-off');
+    let maxStep = 0;
+    for (let i = 1; i < trace.length; i++) {
+      if (trace[i - 1].st === 'drag' || trace[i].st === 'drag') continue;
+      const d = Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y);
+      maxStep = Math.max(maxStep, d);
+    }
+    assert(maxStep <= 60, `slide-off moves continuously, max per-frame step ${maxStep.toFixed(1)}px (n=${trace.length})`);
+    const maxSway = Math.max(...trace.filter(p => p.slid).map(p => Math.abs(p.sway)));
+    assert(maxSway >= 0.3, `tower wobbles on slide-off (ゆらっ), max |sway| ${maxSway.toFixed(2)}°`);
+  });
+
+  await test('oyama F9: home mid-round records partial round; corrupted oyama_logs stay safe', async () => {
+    await page.goto(`${baseURL}/index.html?seed=${SEED}&timescale=${TIMESCALE}&game=oyama`);
+    await waitFor(snap, '__tenbin exposed', 10_000);
+    await waitForRound(0);
+    let s = await snap();
+    await dropOnTower([...s.apples].sort((a, b) => b.r - a.r)[0], s.towers[0]);
+    await waitFor(async () => (await snap()).towers[0].fruits.length === 1, 'one stacked', 10_000);
+    s = await snap();
+    await pressHold({ x: s.homeButton.x + s.homeButton.w / 2, y: s.homeButton.y + s.homeButton.h / 2 },
+      Math.ceil(800 / TIMESCALE) + 400);
+    await waitFor(async () => (await snap()).screen === 'menu', 'back to menu', 10_000);
+    const logs = await readLogs('oyama_logs');
+    const sess = logs[logs.length - 1];
+    assert(sess && sess.endedBy === 'home' && Array.isArray(sess.rounds) && sess.rounds.length === 1,
+      `partial oyama round recorded on home, got ${JSON.stringify(sess && sess.rounds)}`);
+    assert(Number(sess.rounds[0].maxHeight) === 1, `maxHeight 1 recorded, got ${sess.rounds[0].maxHeight}`);
+    // 破損データ耐性（#6/#16/#19 の oyama 版）: 非オブジェクト要素＋文字列数値
+    await page.evaluate(() => localStorage.setItem('oyama_logs',
+      '[null,42,{"game":"oyama","v":1,"rounds":[{"maxHeight":"3","slideOffs":"x","singleTowerClear":1}]}]'));
+    await page.reload();
+    await waitFor(snap, 'reload ok', 10_000);
+    const menu = await openParentMenu();
+    assert(menu.menuOpen, 'parent menu opens with corrupted oyama logs (no freeze)');
+    const clean = await readLogs('oyama_logs');
+    assert(clean.every(x => x && typeof x === 'object'), 'oyama logs sanitized to objects');
+    await tapRegion(menu.menuRegions.close);
+    await waitFor(async () => (await snap()).menuOpen === false, 'menu closes', 5_000);
   });
 
   await test('no text during gameplay (guard) & no page errors', async () => {
